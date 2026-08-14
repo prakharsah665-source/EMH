@@ -4,6 +4,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 
 from config.settings import INTERVIEW_URL
 from pages.interview_launch import LAUNCH_BUTTON_RE
@@ -956,14 +957,8 @@ async def test_audio_configuration():
             # 13. Screenshot
             # =================================================
 
-            await page.screenshot(
-                path="audio_configuration.png",
-                full_page=True,
-            )
-
-            print(
-                "Screenshot saved:"
-                " audio_configuration.png"
+            await save_screenshot(
+                page, "audio_configuration"
             )
 
             # =================================================
@@ -986,14 +981,8 @@ async def test_audio_configuration():
 
             try:
 
-                await page.screenshot(
-                    path="audio_configuration_failed.png",
-                    full_page=True,
-                )
-
-                print(
-                    "Failure screenshot saved:"
-                    " audio_configuration_failed.png"
+                await save_screenshot(
+                    page, "audio_configuration_failed"
                 )
 
             except Exception:

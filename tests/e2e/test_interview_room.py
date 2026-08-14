@@ -4,6 +4,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 
 from config.settings import INTERVIEW_URL
 from pages.interview_launch import LAUNCH_BUTTON_RE
@@ -1118,14 +1119,8 @@ async def test_interview_room():
             # 13. Screenshot
             # =================================================
 
-            await page.screenshot(
-                path="interview_room.png",
-                full_page=True,
-            )
-
-            print(
-                "Screenshot saved:"
-                " interview_room.png"
+            await save_screenshot(
+                page, "interview_room"
             )
 
             # =================================================
@@ -1148,14 +1143,8 @@ async def test_interview_room():
 
             try:
 
-                await page.screenshot(
-                    path="interview_room_failed.png",
-                    full_page=True,
-                )
-
-                print(
-                    "Failure screenshot saved:"
-                    " interview_room_failed.png"
+                await save_screenshot(
+                    page, "interview_room_failed"
                 )
 
             except Exception:

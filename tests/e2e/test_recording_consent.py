@@ -4,6 +4,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 
 from config.settings import INTERVIEW_URL
 from pages.interview_launch import LAUNCH_BUTTON_RE
@@ -841,14 +842,8 @@ async def test_recording_consent():
             # 14. Screenshot
             # =================================================
 
-            await page.screenshot(
-                path="recording_consent.png",
-                full_page=True,
-            )
-
-            print(
-                "Screenshot saved:"
-                " recording_consent.png"
+            await save_screenshot(
+                page, "recording_consent"
             )
 
             # =================================================
@@ -871,14 +866,8 @@ async def test_recording_consent():
 
             try:
 
-                await page.screenshot(
-                    path="recording_consent_failed.png",
-                    full_page=True,
-                )
-
-                print(
-                    "Failure screenshot saved:"
-                    " recording_consent_failed.png"
+                await save_screenshot(
+                    page, "recording_consent_failed"
                 )
 
             except Exception:

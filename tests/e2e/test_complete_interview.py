@@ -9,6 +9,7 @@ from playwright.async_api import (
 )
 
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 
 from config.settings import INTERVIEW_URL
 
@@ -92,22 +93,10 @@ async def debug_page(page: Page, label: str) -> None:
     except Exception as error:
         print(f"Could not read body text: {error}")
 
-    screenshot_path = (
-        DEBUG_DIR / f"{label.lower().replace(' ', '_')}.png"
+    # Timestamped so successive runs never overwrite evidence.
+    await save_screenshot(
+        page, label.lower().replace(" ", "_")
     )
-
-    try:
-        await page.screenshot(
-            path=str(screenshot_path),
-            full_page=True,
-        )
-        print()
-        print(f"Screenshot: {screenshot_path}")
-
-    except Exception as error:
-        print(
-            f"Could not capture screenshot: {error}"
-        )
 
     print("=" * 80)
     print()

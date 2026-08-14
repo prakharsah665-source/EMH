@@ -4,6 +4,7 @@ from playwright.async_api import async_playwright
 from config.settings import INTERVIEW_URL
 from evaluation.redaction import redact_pii
 from pages.interview_launch import LAUNCH_BUTTON_RE
+from tests.e2e.screenshots import save_screenshot
 from config.interview_session import (
     InterviewSessionError,
     require_fresh_interview_url,
@@ -393,14 +394,8 @@ async def test_system_configuration():
             # Screenshot for test evidence
             # ------------------------------------------------
 
-            await page.screenshot(
-                path="system_configuration.png",
-                full_page=True,
-            )
-
-            print(
-                "Screenshot saved:"
-                " system_configuration.png"
+            await save_screenshot(
+                page, "system_configuration"
             )
 
             print()
@@ -416,9 +411,8 @@ async def test_system_configuration():
                 "SYSTEM CONFIGURATION TEST FAILED",
             )
 
-            await page.screenshot(
-                path="system_configuration_failed.png",
-                full_page=True,
+            await save_screenshot(
+                page, "system_configuration_failed"
             )
 
             raise

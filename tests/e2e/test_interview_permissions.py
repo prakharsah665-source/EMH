@@ -8,6 +8,7 @@ from playwright.async_api import (
 
 from config.settings import INTERVIEW_URL
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 
 
 async def create_context(browser: Browser) -> BrowserContext:
@@ -379,19 +380,10 @@ async def run_interview_session(
         )
 
         # Save screenshot for debugging.
-        screenshot_name = (
-            f"interview_session_{session_number}_failed.png"
-        )
-
         try:
-            await page.screenshot(
-                path=screenshot_name,
-                full_page=True,
-            )
-
-            print(
-                "Screenshot saved:",
-                screenshot_name,
+            await save_screenshot(
+                page,
+                f"interview_session_{session_number}_failed",
             )
 
         except Exception as screenshot_error:

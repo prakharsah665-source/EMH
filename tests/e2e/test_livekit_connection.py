@@ -5,6 +5,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 from tests.e2e.session_policy import (
     mark_room_joined,
     resolve_room_session,
@@ -727,22 +728,8 @@ async def test_livekit_connection():
         # 18. SCREENSHOT
         # ==================================================
 
-        screenshot_path = (
-            "artifacts/screenshots/"
-            "livekit_connection.png"
-        )
-
-        await page.screenshot(
-            path=screenshot_path,
-            full_page=True,
-        )
-
-        print(
-            "\nScreenshot saved:"
-        )
-
-        print(
-            screenshot_path
+        await save_screenshot(
+            page, "livekit_connection"
         )
 
         # ==================================================

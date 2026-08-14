@@ -22,6 +22,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from evaluation.redaction import redact_pii
+from tests.e2e.screenshots import save_screenshot
 
 from pages.interview_launch import launch_into_interview_room
 from tests.e2e.session_policy import (
@@ -156,10 +157,9 @@ async def test_continue_to_interview():
             await verify_permissions(page)
             await verify_interview_room(page)
 
-            await page.screenshot(
-                path="continue_to_interview.png", full_page=True
+            await save_screenshot(
+                page, "continue_to_interview"
             )
-            print("Screenshot saved: continue_to_interview.png")
 
             print()
             print("=" * 70)
@@ -171,13 +171,8 @@ async def test_continue_to_interview():
                 page, "CONTINUE TO INTERVIEW TEST FAILED"
             )
             try:
-                await page.screenshot(
-                    path="continue_to_interview_failed.png",
-                    full_page=True,
-                )
-                print(
-                    "Failure screenshot saved: "
-                    "continue_to_interview_failed.png"
+                await save_screenshot(
+                    page, "continue_to_interview_failed"
                 )
             except Exception:
                 pass
