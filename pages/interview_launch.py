@@ -31,19 +31,53 @@ LAUNCH_BUTTON_RE = re.compile(
     r"^(start|continue) interview$", re.IGNORECASE
 )
 
-# The app gates the React Joyride guided tour on this
-# localStorage flag (verified live 2026-08-14): when "true"
-# the tour never renders, so it cannot intercept clicks
-# (Speaker Test, consent). Pre-seeding it is tour PREVENTION,
-# not the bypass of a real UI blocker - the tour is first-run
-# onboarding, not a functional gate.
+# React Joyride tour PREVENTION (not the bypass of a real UI
+# blocker - the tours are first-run onboarding, not functional
+# gates; the flow proceeds identically without them).
+#
+# Two layers, because the app has MORE than one tour and they
+# mount step-by-step at unpredictable times (verified live
+# 2026-08-14: the room tour is gated on the localStorage flag
+# below, but a separate setup-screen tour rendered its
+# spotlight AFTER the first dismissal pass and intercepted the
+# Speaker Test click):
+#   1. localStorage flag for the tour(s) the app gates on it;
+#   2. a CSS rule injected before any app code that keeps every
+#      joyride portal/overlay/spotlight display:none and
+#      pointer-events:none, so no tour can EVER render or
+#      intercept clicks, regardless of which key gates it or
+#      when its steps mount.
 TOUR_COMPLETE_KEY = "interviewRoomTourComplete"
 
-TOUR_SUPPRESS_JS = (
-    "try { localStorage.setItem("
-    f"'{TOUR_COMPLETE_KEY}', 'true'"
-    ") } catch (e) {}"
-)
+TOUR_SUPPRESS_JS = f"""
+(() => {{
+  try {{
+    localStorage.setItem('{TOUR_COMPLETE_KEY}', 'true');
+  }} catch (e) {{}}
+  const inject = () => {{
+    if (document.getElementById('emh-tour-suppress')) return;
+    const style = document.createElement('style');
+    style.id = 'emh-tour-suppress';
+    style.textContent = [
+      '#react-joyride-portal,',
+      '.react-joyride__overlay,',
+      '.react-joyride__spotlight,',
+      '.react-joyride__beacon,',
+      '.__floater {{',
+      '  display: none !important;',
+      '  pointer-events: none !important;',
+      '}}',
+    ].join('\\n');
+    (document.head || document.documentElement)
+      .appendChild(style);
+  }};
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', inject);
+  }} else {{
+    inject();
+  }}
+}})();
+"""
 
 
 class InterviewLaunchError(RuntimeError):
@@ -287,27 +321,33 @@ async def launch_into_interview_room(
 
     await _dismiss_guided_tour(page, log)
 
-    # Post-condition: the tour must actually be gone - a live
-    # overlay intercepts every later click (Speaker Test,
-    # consent) and would surface as fake step failures.
-    tour_active = await page.evaluate(
+    # Post-condition: no tour element may be VISIBLE (mounted-
+    # but-hidden is fine - the CSS suppression keeps portals
+    # display:none). A visible spotlight/overlay intercepts
+    # every later click (Speaker Test, consent) and would
+    # surface as fake step failures.
+    tour_visible = await page.evaluate(
         """
         () => {
-            const portal = document.getElementById(
-                'react-joyride-portal'
+            const parts = document.querySelectorAll(
+                '#react-joyride-portal, ' +
+                '.react-joyride__overlay, ' +
+                '.react-joyride__spotlight, .__floater'
             );
-            return !!(portal && portal.childElementCount > 0);
+            return Array.from(parts).some(
+                el => el.getClientRects().length > 0
+            );
         }
         """
     )
-    if tour_active:
+    if tour_visible:
         raise InterviewLaunchError(
-            "dismiss guided-tour overlay",
+            "suppress guided-tour overlay",
             "harness/ui-overlay",
-            "The React Joyride overlay is still rendered after "
-            "prevention (localStorage "
-            f"{TOUR_COMPLETE_KEY}=true) and 12 dismissal "
-            "attempts - later clicks would be intercepted.",
+            "A React Joyride element is still VISIBLE after CSS "
+            "suppression, the localStorage flag and 12 "
+            "dismissal attempts - later clicks would be "
+            "intercepted.",
         )
     log("Guided tour prevented/dismissed (post-condition met).")
 
@@ -343,7 +383,16 @@ async def launch_into_interview_room(
         speaker_button_present = False
 
     if speaker_button_present:
-        await speaker_test.click()
+        try:
+            await speaker_test.click(timeout=15_000)
+        except Exception as error:
+            raise InterviewLaunchError(
+                "click speaker test button",
+                "harness/ui-overlay",
+                "The 'Test Speaker Before Interview' button "
+                "could not be clicked (an overlay may be "
+                f"intercepting pointer events): {error}",
+            ) from error
         try:
             await page.wait_for_function(
                 _SPEAKER_DONE_JS, timeout=20_000

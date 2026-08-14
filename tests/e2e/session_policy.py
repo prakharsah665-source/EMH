@@ -38,33 +38,45 @@ def resolve_room_session(
     session-layer classification.
     """
 
-    try:
-        url, claims = require_fresh_interview_url()
-    except InterviewSessionError as error:
-        pytest.fail(str(error))
-
-    if consumed_session_entry(claims) is None:
-        return url, claims
-
+    # Room-joining tests must NEVER be the first consumer of
+    # the primary session: if the full-interview capture failed
+    # BEFORE joining the room, the primary session is the only
+    # way to retry that capture, and a room-joiner grabbing it
+    # would destroy that option (this happened live 2026-08-14).
+    # They therefore run ONLY on the isolated
+    # EMH_ROOM_TESTS_URL session.
     isolated = isolated_room_test_url()
     if isolated:
         isolated_claims = decode_interview_claims(isolated)
         if consumed_session_entry(isolated_claims) is None:
             print(
-                f"{test_name}: primary session already "
-                "consumed - using the isolated "
+                f"{test_name}: using the isolated "
                 "EMH_ROOM_TESTS_URL session."
             )
             return isolated, isolated_claims
+        pytest.skip(
+            "SESSION ALREADY CONSUMED - the isolated "
+            "EMH_ROOM_TESTS_URL session's room was already "
+            f"joined, so {test_name} cannot join a fresh room. "
+            "This is a session/environment condition, not a "
+            "bot failure. Provide a fresh EMH_ROOM_TESTS_URL."
+        )
+
+    # Fail loudly on a broken primary config either way, so a
+    # missing/expired URL is still reported at the right layer.
+    try:
+        require_fresh_interview_url()
+    except InterviewSessionError as error:
+        pytest.fail(str(error))
 
     pytest.skip(
-        "SESSION ALREADY CONSUMED - the primary interview "
-        "session's room was already joined (normally by the "
-        f"full-interview evaluation), so {test_name} cannot "
-        "join a fresh room. This is a session/environment "
-        "condition, not a bot failure. Provide a second fresh "
-        "URL via EMH_ROOM_TESTS_URL (or run this test alone "
-        "against a fresh INTERVIEW_URL) to execute it."
+        f"ISOLATED SESSION REQUIRED - {test_name} joins the "
+        "interview room, which fires the agent greeting and "
+        "consumes the session. The primary INTERVIEW_URL is "
+        "reserved for the full-interview evaluation "
+        "(test_bot_responsiveness), so this test only runs "
+        "with a second fresh URL in EMH_ROOM_TESTS_URL. "
+        "Session-policy skip, not a bot failure."
     )
 
 
