@@ -2594,6 +2594,21 @@ async def run_multi_turn(
                 )
                 break
 
+            # Agent-side diagnostics streamed over the LiveKit
+            # data channel often carry the ROOT CAUSE (e.g. the
+            # agent's STT provider erroring) - surface them in
+            # the failure instead of leaving them buried in the
+            # artifacts.
+            try:
+                dc_agent_errors = await page.evaluate(
+                    "() => (window.__emhTranscriptEvents || [])"
+                    ".filter(e => e.text && "
+                    "/error=|APIStatusError|Exception/.test(e.text))"
+                    ".slice(-3).map(e => e.text.slice(0, 300))"
+                )
+            except Exception:
+                dc_agent_errors = []
+
             # Distinguish "no reply at all" from "reply received
             # but not played" so a mid-interview freeze is not
             # blamed on the detector (and vice versa).
@@ -2638,6 +2653,13 @@ async def run_multi_turn(
                             for w in watchdog_hits[-3:]
                         )
                         if watchdog_hits else ""
+                    )
+                    + (
+                        " AGENT-SIDE ERRORS streamed over the "
+                        "LiveKit data channel (likely ROOT "
+                        "CAUSE): "
+                        + " | ".join(dc_agent_errors)
+                        if dc_agent_errors else ""
                     )
                 )
             )

@@ -171,6 +171,10 @@ def test_select_capture_auto_reports_capture_layer(
         "collectors.transcript_capture.DOM_METADATA_PATH",
         tmp_path / "dom.json",
     )
+    monkeypatch.setattr(
+        "collectors.transcript_capture.STT_LOCAL_PATH",
+        tmp_path / "stt.json",
+    )
     with pytest.raises(RuntimeError) as excinfo:
         select_capture()
     # The failure names the capture layer, never the bot.
@@ -265,3 +269,41 @@ def test_capture_evidence_manifest(tmp_path, monkeypatch):
     assert sources["stt_local"]["usable_bot_text"] is True
     assert sources["remote_audio"]["count"] == 1
     assert (tmp_path / "capture_evidence.json").exists()
+
+
+def test_livekit_capture_rejects_agent_session_framing(tmp_path):
+    # Real payloads from a live 'lk.agent.session' data-stream
+    # capture (2026-08-14): ids/topics/mimetypes only. They
+    # must neither make the backend "available" nor become
+    # judged bot turns.
+    events = [
+        {"ev": "message", "label": "_reliable", "kind": "binary",
+         "text": ("agent-AJ_uTHzMTVLZ7Mb PA_7wQqvUykrYKsjl "
+                  "$eaa5aec7-7d41-4e5c-a0af-76b6dc4b49a3 "
+                  "lk.agent.session\" application/octet-streamR "
+                  "AS_76b4ca20461e")},
+        {"ev": "message", "label": "_reliable", "kind": "binary",
+         "text": ("agent-AJ_uTHzMTVLZ7Mb PA_7wQqvUykrYKsre "
+                  "$eaa5aec7 item_39e6acd0aade "
+                  "emh_interview_agent")},
+    ]
+    path = tmp_path / "events.json"
+    path.write_text(json.dumps(events))
+
+    capture = LiveKitEventsCapture(path)
+    assert not capture.available()
+    assert capture.get_turns() == []
+
+    # A genuine spoken sentence inside a binary run still
+    # passes.
+    events.append(
+        {"ev": "message", "label": "_reliable", "kind": "binary",
+         "text": ("PA_7wQqvUykrYKsjl Can you tell me about the "
+                  "most difficult bug you have fixed recently")}
+    )
+    path.write_text(json.dumps(events))
+    capture = LiveKitEventsCapture(path)
+    assert capture.available()
+    turns = capture.get_turns()
+    assert len(turns) == 1
+    assert "difficult bug" in turns[0]["text"]

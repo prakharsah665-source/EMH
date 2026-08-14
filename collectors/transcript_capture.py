@@ -33,6 +33,7 @@ livekit -> app-api -> dom.
 
 import json
 import os
+import re
 import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -437,11 +438,28 @@ def write_capture_evidence(
         and (entry.get("content") or "").strip()
     ]
 
+    # Same speech test the LiveKit backend applies, so the
+    # evidence verdict matches what the backend would serve.
+    def _dc_is_speech(event: dict) -> bool:
+        if event.get("ev") != "message":
+            return False
+        text = (event.get("text") or "").strip()
+        if len(text) < 4:
+            return False
+        # Agent diagnostics are root-cause evidence, not
+        # usable bot SPEECH.
+        if LiveKitEventsCapture._AGENT_ERROR_RE.search(text):
+            return False
+        if event.get("kind") == "string":
+            return True
+        return len(
+            LiveKitEventsCapture._sentence_words(text)
+        ) >= 5
+
     dc_text = [
         event
         for event in datachannel_events
-        if event.get("ev") == "message"
-        and len((event.get("text") or "").strip()) >= 4
+        if _dc_is_speech(event)
     ]
 
     socketio_event_names = set()
@@ -482,6 +500,16 @@ def write_capture_evidence(
                 "events": len(datachannel_events),
                 "events_with_text": len(dc_text),
                 "usable_bot_text": bool(dc_text),
+                "agent_error_events": len(
+                    [
+                        event
+                        for event in datachannel_events
+                        if event.get("text")
+                        and LiveKitEventsCapture._AGENT_ERROR_RE.search(
+                            event["text"]
+                        )
+                    ]
+                ),
             },
             "socketio": {
                 "frames": len(socketio_frames),
@@ -565,6 +593,37 @@ class LiveKitEventsCapture(TranscriptCapture):
         "PA_", "TR_", "lk.", "agent-", "identity",
     )
 
+    # Tokens that mark a printable run as protocol framing
+    # rather than speech (verified against a live capture of
+    # 'lk.agent.session' data streams, 2026-08-14: the runs are
+    # ids/topics/mimetypes; conversation text lives inside the
+    # binary stream payloads, not in the printable runs).
+    _FRAMING_TOKEN_RE = re.compile(
+        r"^\$|^item_|^AS_|^AJ_|^emh_|/|_|\d"
+    )
+
+    # Agent-side diagnostics streamed over the same channel
+    # (e.g. "label='livekit.plugins.openai.stt.STT'
+    # error=APIStatusError(...)"). These are GOLD for root-cause
+    # analysis but must never be judged as bot speech.
+    _AGENT_ERROR_RE = re.compile(
+        r"label='|error=|APIStatusError|APIConnectionError"
+        r"|Traceback|Exception"
+    )
+
+    @classmethod
+    def _sentence_words(cls, text: str) -> list[str]:
+        """Words that could plausibly be natural speech."""
+
+        return [
+            word
+            for word in text.split()
+            if word
+            and not word.startswith(cls._NOISE_PREFIXES)
+            and not cls._FRAMING_TOKEN_RE.search(word)
+            and any(ch.isalpha() for ch in word)
+        ]
+
     def __init__(self, path: Path | None = None):
         # Default resolved at construction so path overrides
         # (tests, alternate artifact roots) take effect.
@@ -586,66 +645,187 @@ class LiveKitEventsCapture(TranscriptCapture):
             text = (event.get("text") or "").strip()
             if len(text) < 4:
                 continue
+            # Agent diagnostics are evidence, not speech.
+            if self._AGENT_ERROR_RE.search(text):
+                continue
+            # Binary payloads must contain sentence-like text,
+            # not just protocol framing, to count as speech -
+            # otherwise this backend reports "available" and
+            # outranks honest fallbacks with a garbage
+            # transcript.
+            if event.get("kind") != "string":
+                if len(self._sentence_words(text)) < 5:
+                    continue
             speech.append(event)
         return speech
+
+    def get_agent_errors(self) -> list[str]:
+        """
+        Agent-side diagnostic lines streamed over the data
+        channel (root-cause evidence, e.g. the agent's STT
+        provider erroring). Deduplicated, order preserved.
+        """
+
+        seen: set[str] = set()
+        errors: list[str] = []
+        for event in self._events():
+            if event.get("ev") != "message":
+                continue
+            text = (event.get("text") or "").strip()
+            if not text or not self._AGENT_ERROR_RE.search(text):
+                continue
+            key = text[:160]
+            if key in seen:
+                continue
+            seen.add(key)
+            errors.append(text[:400])
+        return errors
+
+    @classmethod
+    def _caption_text(cls, text: str) -> str:
+        """
+        Speech content of a binary printable run: framing
+        tokens (ids/topics/mimetypes) removed anywhere in the
+        run; a protobuf length-prefix may remain glued to the
+        first word (handled by the group-anchor step).
+        """
+
+        words = [
+            word
+            for word in text.split()
+            if word
+            and not word.startswith(cls._NOISE_PREFIXES)
+            and not cls._FRAMING_TOKEN_RE.search(word)
+        ]
+        return " ".join(words).strip()
+
+    @staticmethod
+    def _coalesce_captions(captions: list[str]) -> list[str]:
+        """
+        The agent session streams each utterance as CUMULATIVE
+        captions ("Hi", "Hi my", "Hi my name", ...), each with
+        a possibly different one-char protobuf glue prefix.
+        Group consecutive captions of the same utterance, keep
+        the longest, and cut it at the first (clean) caption's
+        anchor so the glue disappears.
+        """
+
+        def same_utterance(prev: str, current: str) -> bool:
+            # Cumulative captions share almost all of the
+            # previous caption's text; chunk boundaries may
+            # shave a few leading chars and append new tail
+            # text, so match on interior slices.
+            if prev[2:60] and prev[2:60] in current:
+                return True
+            if len(prev) > 40 and prev[-36:-8] in current:
+                return True
+            return False
+
+        groups: list[list[str]] = []
+        for caption in captions:
+            if groups and same_utterance(
+                groups[-1][-1], caption
+            ):
+                groups[-1].append(caption)
+            else:
+                groups.append([caption])
+
+        finals = []
+        allowed_tail = ".?!,'\")"
+        for group in groups:
+            longest = max(group, key=len)
+            anchor = group[0][:12]
+            index = longest.find(anchor) if anchor else -1
+            text = longest[index:] if index > 0 else longest
+            # Trailing protobuf glue (e.g. "yourself?(").
+            end = len(text)
+            while end > 0 and not (
+                text[end - 1].isalnum()
+                or text[end - 1] in allowed_tail
+            ):
+                end -= 1
+            while end > 0 and text[end - 1] in "()":
+                end -= 1
+            finals.append(text[:end].strip())
+        return finals
 
     def available(self) -> bool:
         return bool(self._speech_events())
 
     def get_turns(self) -> list[dict[str, Any]]:
         turns: list[dict[str, Any]] = []
+        pending_captions: list[str] = []
+        pending_ts: float | None = None
+
+        def flush_captions() -> None:
+            nonlocal pending_captions, pending_ts
+            for text in self._coalesce_captions(pending_captions):
+                if len(text) >= 12:
+                    turns.append(
+                        make_turn(
+                            # Binary captions come from the
+                            # AGENT session stream (the bot's
+                            # own utterances).
+                            role="assistant",
+                            text=text,
+                            ts=pending_ts,
+                            source="livekit-agent-session",
+                            confidence="medium",
+                        )
+                    )
+            pending_captions = []
+            pending_ts = None
+
         for event in self._speech_events():
             text = event["text"].strip()
-            role = "assistant"
-            confidence = (
-                "high" if event.get("kind") == "string" else "medium"
-            )
 
             if event.get("kind") == "string":
+                flush_captions()
                 # LiveKit chat/transcription payloads are JSON.
                 try:
                     payload = json.loads(text)
                 except ValueError:
                     payload = None
-                if isinstance(payload, dict):
-                    inner = (
-                        payload.get("text")
-                        or payload.get("message")
-                        or ""
-                    )
-                    if not inner.strip():
-                        continue
-                    identity = str(
-                        payload.get("participantIdentity")
-                        or payload.get("identity")
-                        or ""
-                    )
-                    role = (
-                        "user"
-                        if "candidate" in identity.lower()
-                        else "assistant"
-                    )
-                    text = inner.strip()
-            else:
-                # Binary extraction: drop framing-only runs.
-                words = [
-                    w
-                    for w in text.split()
-                    if not w.startswith(self._NOISE_PREFIXES)
-                ]
-                text = " ".join(words)
-                if len(text) < 12:
+                if not isinstance(payload, dict):
                     continue
-
-            turns.append(
-                make_turn(
-                    role=role,
-                    text=text,
-                    ts=event.get("ts"),
-                    source=f"livekit-{event.get('label') or 'datachannel'}",
-                    confidence=confidence,
+                inner = (
+                    payload.get("text")
+                    or payload.get("message")
+                    or ""
                 )
-            )
+                if not inner.strip():
+                    continue
+                identity = str(
+                    payload.get("participantIdentity")
+                    or payload.get("identity")
+                    or ""
+                )
+                turns.append(
+                    make_turn(
+                        role=(
+                            "user"
+                            if "candidate" in identity.lower()
+                            else "assistant"
+                        ),
+                        text=inner.strip(),
+                        ts=event.get("ts"),
+                        source=(
+                            "livekit-"
+                            f"{event.get('label') or 'datachannel'}"
+                        ),
+                        confidence="high",
+                    )
+                )
+                continue
+
+            caption = self._caption_text(text)
+            if len(self._sentence_words(caption)) < 5:
+                continue
+            if pending_ts is None:
+                pending_ts = event.get("ts")
+            pending_captions.append(caption)
+
+        flush_captions()
         return turns
 
 

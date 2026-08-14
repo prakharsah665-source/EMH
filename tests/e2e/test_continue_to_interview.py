@@ -137,6 +137,14 @@ async def test_continue_to_interview():
         context = await browser.new_context(
             permissions=["camera", "microphone"],
         )
+        # Fake-mic injection harness: on a FRESH isolated
+        # session the setup screen's microphone check needs
+        # real audio energy (Chrome's beep tone is not speech),
+        # otherwise the speaker/consent steps stay blocked and
+        # the launch fails at the audio/environment layer.
+        from tests.e2e.test_bot_responsiveness import INIT_SCRIPT
+
+        await context.add_init_script(INIT_SCRIPT)
         page = await context.new_page()
 
         try:
