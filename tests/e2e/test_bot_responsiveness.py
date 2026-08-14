@@ -87,6 +87,10 @@ from pathlib import Path
 import pytest
 from playwright.async_api import async_playwright
 
+from collectors.transcript_capture import (
+    TRANSCRIPT_HOOK_JS,
+    drain_transcript_events,
+)
 from collectors.transcript_collector import (
     TranscriptCollector,
     save_audio_turn_records,
@@ -2462,6 +2466,10 @@ async def test_bot_greets_first_then_stays_responsive():
             permissions=["camera", "microphone"],
         )
         await context.add_init_script(INIT_SCRIPT)
+        # Record LiveKit data-channel traffic (transcription/
+        # chat text, if the agent publishes any) - see
+        # collectors/transcript_capture.py.
+        await context.add_init_script(TRANSCRIPT_HOOK_JS)
         await context.tracing.start(screenshots=True, snapshots=True)
 
         page = await context.new_page()
@@ -2589,6 +2597,32 @@ async def test_bot_greets_first_then_stays_responsive():
             # audio records for the evaluation layers, whether
             # the run passed or failed - a partial transcript
             # from a failed run is still real product output.
+            #
+            # Drain the LiveKit data-channel transcript hook
+            # FIRST: it both answers whether the agent publishes
+            # text (transcriptions/chat ride the WebRTC data
+            # channel, invisible to DOM and WebSocket capture)
+            # and, when it does, provides the preferred
+            # transcript source (collectors.transcript_capture).
+            try:
+                dc_events = await drain_transcript_events(page)
+                dc_text = [
+                    e for e in dc_events
+                    if e.get("ev") == "message" and e.get("text")
+                ]
+                print(
+                    "LiveKit data-channel transcript hook: "
+                    f"{len(dc_events)} events, "
+                    f"{len(dc_text)} with text -> "
+                    "artifacts/transcripts/"
+                    "livekit_transcript_events.json"
+                )
+            except Exception as error:
+                print(
+                    "LiveKit transcript hook drain failed "
+                    f"(harness issue, not a bot failure): {error}"
+                )
+
             transcript_path = collector.save()
             records_path = save_audio_turn_records(audio_records)
             status_path = save_transcript_status(

@@ -4,6 +4,7 @@ import re
 import pytest
 from playwright.async_api import async_playwright
 
+from evaluation.redaction import redact_pii
 from tests.e2e.session_policy import (
     mark_room_joined,
     resolve_room_session,
@@ -676,8 +677,10 @@ async def test_livekit_connection():
             "body"
         ).inner_text()
 
+        # PII-redacted and bounded: raw page bodies must never
+        # reach stdout (it lands in the JUnit/HTML reports).
         print(
-            body
+            redact_pii(body[:6000])
         )
 
         # ==================================================

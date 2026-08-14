@@ -8,6 +8,8 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from evaluation.redaction import redact_pii
+
 from config.settings import INTERVIEW_URL
 
 
@@ -85,7 +87,7 @@ async def debug_page(page: Page, label: str) -> None:
     try:
         body_text = await page.locator("body").inner_text()
 
-        print(body_text[:5000])
+        print(redact_pii(body_text[:5000]))
 
     except Exception as error:
         print(f"Could not read body text: {error}")

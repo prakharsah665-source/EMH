@@ -3,6 +3,8 @@ from urllib.parse import urlparse
 import pytest
 from playwright.async_api import async_playwright
 
+from evaluation.redaction import redact_pii
+
 from config.settings import INTERVIEW_URL
 from pages.interview_launch import LAUNCH_BUTTON_RE
 from config.interview_session import (
@@ -44,7 +46,7 @@ async def print_page_state(page, title):
         body = await page.locator("body").inner_text()
 
         print("\nPAGE TEXT:")
-        print(body[:8000])
+        print(redact_pii(body[:8000]))
 
     except Exception as error:
         print(

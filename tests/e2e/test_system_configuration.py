@@ -2,6 +2,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from config.settings import INTERVIEW_URL
+from evaluation.redaction import redact_pii
 from pages.interview_launch import LAUNCH_BUTTON_RE
 from config.interview_session import (
     InterviewSessionError,
@@ -21,7 +22,7 @@ async def print_page_state(page, title):
     try:
         text = await page.locator("body").inner_text()
         print("\nPAGE TEXT:")
-        print(text[:6000])
+        print(redact_pii(text[:6000]))
     except Exception as error:
         print("Could not read page:", error)
 

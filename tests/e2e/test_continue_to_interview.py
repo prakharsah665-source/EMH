@@ -21,6 +21,8 @@ real interview room actually loaded.
 import pytest
 from playwright.async_api import async_playwright
 
+from evaluation.redaction import redact_pii
+
 from pages.interview_launch import launch_into_interview_room
 from tests.e2e.session_policy import (
     mark_room_joined,
@@ -42,7 +44,7 @@ async def print_page_state(page, title):
         body = await page.locator("body").inner_text()
         print()
         print("PAGE TEXT:")
-        print(body[:10000])
+        print(redact_pii(body[:10000]))
     except Exception as error:
         print("Could not read page text:", error)
     print("=" * 70)

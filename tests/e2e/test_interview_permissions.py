@@ -7,6 +7,7 @@ from playwright.async_api import (
 )
 
 from config.settings import INTERVIEW_URL
+from evaluation.redaction import redact_pii
 
 
 async def create_context(browser: Browser) -> BrowserContext:
@@ -33,7 +34,7 @@ async def print_debug_info(page: Page, message: str) -> None:
     try:
         body = await page.locator("body").inner_text()
         print("\nPAGE TEXT:")
-        print(body[:5000])
+        print(redact_pii(body[:5000]))
     except Exception as exc:
         print("Could not read page:", exc)
 
@@ -256,7 +257,7 @@ async def check_interview_started(page: Page) -> None:
     ).lower()
 
     print("\nCurrent page text:")
-    print(body[:5000])
+    print(redact_pii(body[:5000]))
 
     # Check for common indicators that the interview started.
     interview_indicators = [
