@@ -1,0 +1,46 @@
+AI Interviewer:
+Welcome to the interview. Let's start with React.
+Can you explain what React is?
+
+Candidate:
+React is a JavaScript library used to build user interfaces.
+It allows developers to create reusable components.
+
+AI Interviewer:
+That's correct. Can you explain why reusable components
+are useful in a React application?
+
+Candidate:
+They allow us to split the UI into smaller pieces and reuse
+those pieces in different parts of the application.
+
+AI Interviewer:
+Good. Now let's go a little deeper.
+What is the difference between state and props in React?
+
+Candidate:
+Props are values passed from a parent component to a child,
+while state is data managed by a component that can change
+over time.
+
+AI Interviewer:
+Can you give me an example where you would use state?
+
+Candidate:
+For example, a form input, counter, or modal visibility.
+The component needs to update when the value changes.
+
+AI Interviewer:
+Good. Based on your answers, let's move to a practical
+scenario. Suppose a React page is re-rendering more often
+than expected. How would you investigate the problem?
+
+Candidate:
+I would inspect which state or props are changing and use
+React developer tools to identify unnecessary renders.
+I would then check whether components need memoization
+or whether the state can be structured differently.
+
+AI Interviewer:
+That's a good approach. Thank you for completing the
+technical interview.

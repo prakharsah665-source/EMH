@@ -1,0 +1,14 @@
+{
+  "description": "Diarization merges everything into one speaker with wrong boundaries. Reference: candidate 0-5, background 6-8 (total 7s). Detected: one speaker 0-7.5. Expected components: confusion 1.5s (6-7.5 background as candidate), missed detection 0.5s (7.5-8), false alarm 1.0s (5-6), DER = 3/7.",
+  "turn": 5,
+  "interviewer_prompt": "How do you approach problems?",
+  "reference_transcript": "I break problems into smaller parts and validate each assumption.",
+  "stt_transcript": "I break problems into smaller parts and validate each assumption.",
+  "reference_segments": [
+    {"start": 0.0, "end": 5.0, "speaker": "candidate"},
+    {"start": 6.0, "end": 8.0, "speaker": "background"}
+  ],
+  "detected_segments": [
+    {"start": 0.0, "end": 7.5, "speaker": "SPEAKER_00"}
+  ]
+}

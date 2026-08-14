@@ -1,0 +1,9 @@
+playwright
+pytest
+pytest-asyncio
+python-dotenv
+requests
+deepeval
+jiwer
+pyannote.metrics
+pytest-html

@@ -1,0 +1,11 @@
+{
+  "description": "No reference transcript and no reference speaker segments (nothing captured for this turn). STT evaluation must raise MissingReferenceError and diarization must return available=false with a reason - never a fake perfect score.",
+  "turn": 6,
+  "interviewer_prompt": "Where do you see yourself in five years?",
+  "reference_transcript": null,
+  "stt_transcript": "in five years i see myself leading a small engineering team",
+  "reference_segments": null,
+  "detected_segments": [
+    {"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"}
+  ]
+}

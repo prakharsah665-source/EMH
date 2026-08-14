@@ -1,0 +1,35 @@
+name: Evaluation (Local, Offline)
+
+# Fast, deterministic checks that need NO secrets, NO live EMH
+# app and NO NVIDIA credits: jiwer WER, pyannote diarization
+# fixtures, transcript-collector units, and the defensive
+# security detectors. Runs on every push and PR.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  local-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Audio metrics, transcript capture, security detectors
+        run: |
+          python -m pytest \
+            tests/audio_eval \
+            tests/collectors \
+            tests/security \
+            -v

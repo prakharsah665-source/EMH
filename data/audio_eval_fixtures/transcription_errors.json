@@ -1,0 +1,13 @@
+{
+  "description": "Known STT errors, placed so the minimal alignment is unambiguous: 'well' added at the start (1 insertion), 'years'->'ears' (1 substitution), 'in' dropped (1 deletion) over an 11-word reference. Expected WER exactly 3/11.",
+  "turn": 2,
+  "interviewer_prompt": "How much experience do you have?",
+  "reference_transcript": "I have six years of experience building backend services in Python.",
+  "stt_transcript": "Well I have six ears of experience building backend services Python.",
+  "reference_segments": [
+    {"start": 0.0, "end": 4.0, "speaker": "candidate"}
+  ],
+  "detected_segments": [
+    {"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"}
+  ]
+}

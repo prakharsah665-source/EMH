@@ -1,0 +1,96 @@
+name: "Evaluation (Live: Responsiveness + AI Quality)"
+
+# Live pipeline gated behind secrets. It runs the bot-
+# responsiveness E2E against the real EMH interview, captures the
+# REAL transcript, then evaluates that transcript with the
+# Nemotron judge (3-run median) and runs judge calibration.
+#
+# Manual (workflow_dispatch) or nightly. Requires repo secrets:
+#   INTERVIEW_URL   - the EMH interview URL (contains the JWT)
+#   NVIDIA_API_KEY  - Nemotron judge credits
+# The quality job consumes the transcript artifact produced by
+# the responsiveness job, so AI quality is always evaluated on
+# REAL captured output (no synthetic fallback).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  bot-responsiveness:
+    runs-on: ubuntu-latest
+    env:
+      INTERVIEW_URL: ${{ secrets.INTERVIEW_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Bot responsiveness (captures real transcript)
+        run: |
+          python -m pytest tests/e2e/test_bot_responsiveness.py -s
+
+      - name: Upload captured transcript + audio records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-transcript
+          path: |
+            artifacts/transcripts/actual_transcript.json
+            artifacts/transcripts/actual_transcript_status.json
+            artifacts/transcripts/actual_transcript_capture_metadata.json
+            artifacts/transcripts/audio_turn_records.json
+          if-no-files-found: warn
+
+  ai-quality:
+    needs: bot-responsiveness
+    runs-on: ubuntu-latest
+    env:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      NVIDIA_BASE_URL: ${{ secrets.NVIDIA_BASE_URL }}
+      NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
+      INTERVIEW_URL: ${{ secrets.INTERVIEW_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download captured transcript
+        uses: actions/download-artifact@v4
+        with:
+          name: real-transcript
+          path: artifacts/transcripts
+
+      - name: Judge calibration (known-good / known-bad)
+        run: |
+          python -m pytest tests/evaluation/test_judge_calibration.py -v
+
+      - name: Real-transcript quality gate (3-run median)
+        run: |
+          python -m pytest \
+            tests/evaluation/test_interview_quality.py \
+            tests/ai_quality/test_real_interview_quality.py \
+            tests/security/test_transcript_security_audit.py \
+            -v
+
+      - name: Audio metrics on real captured artifacts
+        run: |
+          python -m pytest tests/audio_eval/test_real_artifacts.py -v

@@ -1,0 +1,21 @@
+# Security red-team layer (DeepTeam) - SEPARATE environment.
+#
+# DeepTeam requires Python >=3.9,<3.14. The main project venv is
+# Python 3.14, where deepteam cannot be installed; evaluation/
+# security_redteam.py is import-guarded so the rest of the suite
+# is unaffected. To run the live red-team, use a dedicated venv:
+#
+#     python3.13 -m venv .venv-security
+#     .venv-security/bin/pip install -r requirements-security.txt
+#     EMH_LIVE_REDTEAM=1 EMH_REDTEAM_TARGET="mod:fn" \
+#         .venv-security/bin/pytest tests/security -m security_live
+#
+# The offline detector suite (tests/security/test_security_detectors
+# and test_transcript_security_audit) needs none of this and runs
+# in the main venv.
+
+deepteam
+sentry-sdk
+pytest
+pytest-asyncio
+python-dotenv

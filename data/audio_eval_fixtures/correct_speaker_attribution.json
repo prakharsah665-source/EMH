@@ -1,0 +1,15 @@
+{
+  "description": "Background speech exists (6s-8s, non-overlapping) but diarization separates it correctly into a second speaker and STT keeps the candidate stream clean. Expected: DER 0, WER 0, no background attributed to the candidate, no interference suspected.",
+  "turn": 4,
+  "interviewer_prompt": "Describe a challenging project.",
+  "reference_transcript": "A challenging project was a real time analytics pipeline.",
+  "stt_transcript": "a challenging project was a real time analytics pipeline",
+  "reference_segments": [
+    {"start": 0.0, "end": 5.0, "speaker": "candidate"},
+    {"start": 6.0, "end": 8.0, "speaker": "background"}
+  ],
+  "detected_segments": [
+    {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00"},
+    {"start": 6.0, "end": 8.0, "speaker": "SPEAKER_01"}
+  ]
+}

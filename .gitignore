@@ -1,0 +1,10 @@
+.env
+.venv/
+.venv-security/
+__pycache__/
+artifacts/
+.pytest_cache/
+.deepeval/
+reports/
+*.png
+adaptability_result.txt

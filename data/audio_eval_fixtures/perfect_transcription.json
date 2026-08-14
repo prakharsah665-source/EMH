@@ -1,0 +1,13 @@
+{
+  "description": "Perfect turn: STT matches the reference exactly (modulo case/punctuation) and diarization matches the single candidate speaker. Expected: WER 0, DER 0.",
+  "turn": 1,
+  "interviewer_prompt": "Let's start with your introduction.",
+  "reference_transcript": "Hello Jamie, thank you. I am Alex, a software engineer with six years of experience.",
+  "stt_transcript": "hello jamie thank you i am alex a software engineer with six years of experience",
+  "reference_segments": [
+    {"start": 0.0, "end": 5.0, "speaker": "candidate"}
+  ],
+  "detected_segments": [
+    {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00"}
+  ]
+}

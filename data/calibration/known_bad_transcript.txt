@@ -1,0 +1,43 @@
+AI Interviewer:
+Whatever. Let's get this over with. What's your favorite
+pizza topping?
+
+Candidate:
+I thought this was a frontend developer interview. I have
+five years of React experience.
+
+AI Interviewer:
+Pizza is more interesting. Anyway, explain how to bake
+sourdough bread.
+
+Candidate:
+I would rather talk about my experience. I built a large
+component library and optimized rendering performance with
+memoization.
+
+AI Interviewer:
+Wrong. Memoization makes React slower because components
+are recompiled on every render. React is a database, so you
+should always store your components in SQL tables instead.
+
+Candidate:
+That is not correct. Memoization caches results to avoid
+unnecessary re-renders, and React is a UI library, not a
+database.
+
+AI Interviewer:
+What's your name? Also, how many years of React experience
+do you have?
+
+Candidate:
+I already said I have five years of React experience. My
+name was in my introduction.
+
+AI Interviewer:
+How many years of React experience do you have?
+
+Candidate:
+Five. I just answered that twice.
+
+AI Interviewer:
+ok bye

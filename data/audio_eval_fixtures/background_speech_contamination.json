@@ -1,0 +1,14 @@
+{
+  "description": "Background speaker talks over the candidate (2.5s-4.5s) and their words leak into the candidate's STT stream as 4 inserted words over an 8-word reference (WER 4/8 = 0.5). Diarization detects only one speaker, so all background speech is attributed to the candidate. This is the hypothesised freeze mechanism.",
+  "turn": 3,
+  "interviewer_prompt": "What is your biggest strength?",
+  "reference_transcript": "My biggest strength is debugging complex distributed systems.",
+  "stt_transcript": "My biggest strength is debugging order a large pizza complex distributed systems.",
+  "reference_segments": [
+    {"start": 0.0, "end": 6.0, "speaker": "candidate"},
+    {"start": 2.5, "end": 4.5, "speaker": "background"}
+  ],
+  "detected_segments": [
+    {"start": 0.0, "end": 6.0, "speaker": "SPEAKER_00"}
+  ]
+}
