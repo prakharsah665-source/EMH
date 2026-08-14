@@ -1,138 +1,41 @@
-from deepeval import assert_test
-from config.settings import NVIDIA_BASE_URL, NVIDIA_MODEL
-from evaluators.nvidia_judge import get_nvidia_judge
-from deepeval.test_case import Turn, ConversationalTestCase
-from deepeval.metrics import KnowledgeRetentionMetric
+"""
+Context retention of the REAL interviewer.
+
+Judges whether the interviewer remembers what the candidate
+said earlier across the real captured transcript
+(TranscriptCapture). Skips with a capture-layer reason when
+capture provenance is insufficient - synthetic data is never
+scored silently.
+
+Provenance note: retention judgments depend on the EXACT
+earlier candidate content, so stt-derived text is rejected
+(exclude_sources=("stt-local",)) - STT normalisation can make
+the interviewer appear to forget or contradict details it was
+actually given. "medium" confidence or better is required.
+"""
+
+import pytest
+
+from evaluators.real_capture_case import judge_real_dimension
 
 
-# ============================================================
-# NVIDIA NEMOTRON CONFIGURATION
-# ============================================================
-
-
-
-# Create the NVIDIA Nemotron judge explicitly.
-#
-# This avoids relying on DeepEval's global provider selection,
-# which was resolving to LocalModel(model=None) in your setup.
-#
-nvidia_model = get_nvidia_judge()
-
-
-# ============================================================
-# CONTEXT RETENTION TEST
-# ============================================================
-
-
-def test_context_retention():
-
-    print()
-    print("=" * 70)
-    print("AI CONTEXT RETENTION TEST")
-    print("=" * 70)
-
-    print()
-    print("Evaluation model:", NVIDIA_MODEL)
-    print("NVIDIA base URL:", NVIDIA_BASE_URL)
-
-    # ========================================================
-    # Conversation
-    # ========================================================
-
-    test_case = ConversationalTestCase(
-
-        turns=[
-
-            # ------------------------------------------------
-            # TURN 1 - Candidate provides important information
-            # ------------------------------------------------
-
-            Turn(
-                role="user",
-                content=(
-                    "I have around two years of experience with React "
-                    "and I recently worked on a student management "
-                    "application."
-                ),
-            ),
-
-            # ------------------------------------------------
-            # TURN 2 - AI acknowledges information
-            # ------------------------------------------------
-
-            Turn(
-                role="assistant",
-                content=(
-                    "That's good experience. Your work with React "
-                    "and the student management application gives "
-                    "you practical frontend experience."
-                ),
-            ),
-
-            # ------------------------------------------------
-            # TURN 3 - Candidate asks a follow-up
-            # ------------------------------------------------
-
-            Turn(
-                role="user",
-                content=(
-                    "What kind of project experience would you "
-                    "highlight during a frontend interview?"
-                ),
-            ),
-
-            # ------------------------------------------------
-            # TURN 4 - AI should retain previous information
-            # ------------------------------------------------
-
-            Turn(
-                role="assistant",
-                content=(
-                    "I would highlight your React experience and "
-                    "your student management application. You can "
-                    "explain the components you built, state "
-                    "management, API integration, and the challenges "
-                    "you solved."
-                ),
-            ),
-        ]
+@pytest.mark.ai_evaluation
+def test_real_interviewer_context_retention():
+    judge_real_dimension(
+        name="context_retention",
+        criteria=(
+            "Evaluate whether the AI interviewer in the actual "
+            "output retains and correctly uses information the "
+            "candidate provided earlier in the interview "
+            "(experience, projects, technologies). Later "
+            "interviewer turns should build on those details "
+            "without contradicting them, misattributing them, "
+            "or re-asking for information the candidate already "
+            "gave. Penalize forgetting, contradiction, and "
+            "re-asking answered questions proportionally to how "
+            "often they occur. Judge ONLY the turns labelled "
+            "'AI Interviewer'."
+        ),
+        min_confidence="medium",
+        exclude_sources=("stt-local",),
     )
-
-    # ========================================================
-    # Knowledge Retention Metric
-    # ========================================================
-
-    print()
-    print("Creating Knowledge Retention metric...")
-
-    metric = KnowledgeRetentionMetric(
-        threshold=0.70,
-        model=nvidia_model,
-        include_reason=True,
-        verbose_mode=True,
-    )
-
-    print("[PASS] NVIDIA Nemotron model configured.")
-    print("[PASS] Knowledge Retention metric configured.")
-
-    # ========================================================
-    # Run DeepEval
-    # ========================================================
-
-    print()
-    print("Running AI context retention evaluation...")
-    print("Model:", NVIDIA_MODEL)
-
-    assert_test(
-        test_case,
-        [metric],
-    )
-
-    # ========================================================
-    # Result
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print("CONTEXT RETENTION TEST PASSED")
-    print("=" * 70)

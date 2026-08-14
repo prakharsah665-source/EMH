@@ -192,6 +192,37 @@ def test_interview_overall_quality():
     print("=" * 70)
 
     # --------------------------------------------------------
+    # Judge stability gate: the disagreement value is computed
+    # by consistency.py - ASSERT it. A criterion whose three
+    # identical runs differ by >= 2 rubric buckets is an
+    # unstable judgment; neither its pass nor its fail can be
+    # trusted. EVALUATOR failure classification, not a bot
+    # failure.
+    # --------------------------------------------------------
+
+    unstable = final_result.get("disagreement_criteria", [])
+    if unstable:
+        details = "\n".join(
+            f"  {name}: runs="
+            f"{criteria[name]['run_scores']} "
+            f"(spread {criteria[name]['spread']:.2f})\n"
+            f"    judge: "
+            f"{(criteria[name].get('reasoning') or '').strip()}"
+            for name in unstable
+        )
+        pytest.fail(
+            "\n"
+            "JUDGE UNSTABLE (evaluator failure, NOT an "
+            "interview quality failure)\n"
+            "Identical evaluation runs disagreed by >= 0.50 "
+            "on:\n"
+            f"{details}\n"
+            "The median scores cannot be trusted in either "
+            "direction - inspect the per-run reasoning and "
+            "judge configuration, then re-run the gate.\n"
+        )
+
+    # --------------------------------------------------------
     # Overall quality gate
     # --------------------------------------------------------
 

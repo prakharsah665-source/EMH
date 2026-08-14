@@ -112,4 +112,26 @@ def assert_metric_median(
         f"Reasons: {result['run_reasons']}\n"
     )
 
+    # A median above threshold is not trustworthy when the
+    # three identical runs disagree by two or more rubric
+    # buckets - the judgment itself is unstable. This is an
+    # EVALUATOR/JUDGE failure classification, not a bot
+    # failure: the score cannot be relied on in either
+    # direction.
+    assert not result["disagreement"], (
+        f"\n{result['metric']} JUDGE UNSTABLE "
+        "(evaluator failure, NOT a bot failure)\n"
+        f"Identical runs scored {result['run_scores']} "
+        f"(spread {result['spread']:.2f} >= "
+        f"{DISAGREEMENT_SPREAD:.2f}), so neither pass nor "
+        "fail is trustworthy. Inspect the per-run reasoning "
+        "and the judge configuration before rerunning:\n"
+        + "\n".join(
+            f"  run {index}: {reason[:300]}"
+            for index, reason in enumerate(
+                result["run_reasons"], 1
+            )
+        )
+    )
+
     return result
