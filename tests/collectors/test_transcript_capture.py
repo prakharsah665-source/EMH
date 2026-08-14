@@ -180,3 +180,88 @@ def test_select_capture_auto_reports_capture_layer(
 def test_app_api_capture_unavailable_without_env(monkeypatch):
     monkeypatch.delenv("EMH_TRANSCRIPT_API_URL", raising=False)
     assert not AppApiCapture().available()
+
+
+# ============================================================
+# SttCapture (stt-local fallback)
+# ============================================================
+
+def test_stt_capture_serves_transcribed_turns(tmp_path):
+    manifest = [
+        {"turn": 0, "role": "assistant",
+         "audio_path": "artifacts/audio/bot_turn_00_greeting.webm",
+         "text": "Hi, I'm Jamie. Let's start with your introduction."},
+        {"turn": 1, "role": "user",
+         "audio_path": "data/audio_fixtures/answer_01.wav",
+         "text": "Hello Jamie, I'm Alex, a backend engineer."},
+        {"turn": 1, "role": "assistant",
+         "audio_path": "artifacts/audio/bot_turn_01.webm",
+         "text": "Great. What drew you to backend work?"},
+        {"turn": 2, "role": "user",
+         "audio_path": "x.wav", "text": "   "},  # empty -> dropped
+    ]
+    path = tmp_path / "stt_local_transcript.json"
+    path.write_text(json.dumps(manifest))
+
+    capture = SttCapture(path)
+    assert capture.available()
+    turns = capture.get_turns()
+
+    assert [t["role"] for t in turns] == [
+        "assistant", "user", "assistant"
+    ]
+    assert all(t["source"] == "stt-local" for t in turns)
+    assert all(t["confidence"] == "medium" for t in turns)
+    # Conversational order: greeting, answer 1, reply 1.
+    assert "introduction" in turns[0]["text"]
+    assert "backend engineer" in turns[1]["text"]
+
+
+def test_stt_capture_unavailable_without_text(tmp_path):
+    path = tmp_path / "stt.json"
+    path.write_text(json.dumps(
+        [{"turn": 1, "role": "assistant", "text": ""}]
+    ))
+    assert not SttCapture(path).available()
+    assert not SttCapture(tmp_path / "missing.json").available()
+
+
+def test_auto_order_prefers_stt_over_dom_never_over_livekit():
+    from collectors.transcript_capture import AUTO_ORDER
+
+    assert AUTO_ORDER.index("livekit") < AUTO_ORDER.index("stt")
+    assert AUTO_ORDER.index("app-api") < AUTO_ORDER.index("stt")
+    assert AUTO_ORDER.index("stt") < AUTO_ORDER.index("dom")
+
+
+def test_capture_evidence_manifest(tmp_path, monkeypatch):
+    from collectors import transcript_capture as tc
+
+    monkeypatch.setattr(
+        tc, "CAPTURE_EVIDENCE_PATH",
+        tmp_path / "capture_evidence.json",
+    )
+    stt_path = tmp_path / "stt.json"
+    stt_path.write_text(json.dumps(
+        [{"turn": 0, "role": "assistant", "text": "Hello there."}]
+    ))
+    monkeypatch.setattr(tc, "STT_LOCAL_PATH", stt_path)
+
+    evidence = tc.write_capture_evidence(
+        dom_metadata=[{"role": "user", "content": "hi"}],
+        datachannel_events=[{"ev": "channel", "label": "x"}],
+        socketio_frames=[
+            {"payload": '42["bot-speech-ended",{"isExit":true}]'}
+        ],
+        audio_files=["artifacts/audio/bot_turn_00.webm"],
+        stt_summary={"requested": 2, "transcribed": 2,
+                     "skipped_reason": None},
+    )
+
+    sources = evidence["sources"]
+    assert sources["dom"]["usable_bot_text"] is False
+    assert sources["livekit_datachannel"]["usable_bot_text"] is False
+    assert sources["socketio"]["event_names"] == ["bot-speech-ended"]
+    assert sources["stt_local"]["usable_bot_text"] is True
+    assert sources["remote_audio"]["count"] == 1
+    assert (tmp_path / "capture_evidence.json").exists()

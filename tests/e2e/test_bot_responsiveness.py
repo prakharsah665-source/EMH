@@ -75,6 +75,7 @@ Run with the existing command:
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -88,8 +89,14 @@ import pytest
 from playwright.async_api import async_playwright
 
 from collectors.transcript_capture import (
+    AUDIO_RECORD_JS,
     TRANSCRIPT_HOOK_JS,
+    clear_previous_capture_artifacts,
     drain_transcript_events,
+    start_bot_audio_recording,
+    stop_bot_audio_recording,
+    transcribe_captured_audio,
+    write_capture_evidence,
 )
 from collectors.transcript_collector import (
     TranscriptCollector,
@@ -199,17 +206,147 @@ AGENT_ERROR_PATTERN = re.compile(
 
 # Candidate answers spoken into the fake microphone AFTER the
 # greeting, one per turn (cycled if TURNS exceeds the list).
+# Deliberately LONG and interview-realistic (multiple points,
+# concrete examples, natural asides) so the evaluation
+# exercises long-context STT -> AI -> TTS behaviour, follow-up
+# grounding, context retention and stability across the whole
+# interview - not just one-liner turn-taking.
 CANDIDATE_ANSWERS = [
-    "Hello Jamie, thank you. I am Alex, a software engineer with six years of experience, mostly building backend services in Python and Node.",
-    "In my last role I led the migration of a monolith to microservices, which reduced our deployment time significantly.",
-    "My biggest strength is debugging complex distributed systems, and I enjoy mentoring junior engineers.",
-    "A challenging project I worked on was a real time analytics pipeline that processed millions of events per day.",
-    "I usually approach problems by breaking them into smaller parts and validating each assumption with data.",
-    "I collaborate closely with product managers and designers, and I value clear written communication.",
-    "In five years I see myself leading a small engineering team while still contributing to the codebase.",
-    "I handle disagreements by focusing on the shared goal and backing my position with evidence.",
-    "I am motivated by shipping products that people actually use every day.",
-    "That covers my experience. Thank you for the conversation, I have no further questions.",
+    (
+        "Hello Jamie, thank you, it's nice to meet you. I'm Alex, "
+        "a software engineer with about six years of experience, "
+        "mostly on backend systems in Python and Node. I started "
+        "out at a logistics startup where I built order-tracking "
+        "APIs, and for the last three years I've been at a "
+        "payments company where I own the transaction-processing "
+        "services. Along the way I've picked up a lot of "
+        "operational experience too, things like on-call, "
+        "observability and capacity planning, and I genuinely "
+        "enjoy the reliability side of engineering as much as the "
+        "feature side."
+    ),
+    (
+        "The project I'm proudest of recently is a migration of "
+        "our payments monolith to microservices. We had a single "
+        "Django application handling everything from checkout to "
+        "reconciliation, and deployments had become genuinely "
+        "risky, a bad release could block refunds for hours. I "
+        "led the effort to carve out the highest-risk domains "
+        "first, starting with the ledger service. We used the "
+        "strangler pattern, kept a compatibility layer so the "
+        "monolith and the new services could co-exist, and moved "
+        "traffic over gradually with feature flags. After about "
+        "nine months our deployment frequency went from weekly "
+        "to daily and rollbacks became a five-minute operation "
+        "instead of an incident."
+    ),
+    (
+        "I'd say my biggest strength is debugging complex "
+        "distributed problems calmly. A good example is a "
+        "duplicate-charge bug we saw roughly once in every "
+        "hundred thousand transactions. It turned out to be a "
+        "retry storm caused by a load balancer timeout that was "
+        "shorter than our downstream payment provider's p99 "
+        "latency, so a small percentage of requests were retried "
+        "while the original was still in flight. I found it by "
+        "correlating trace IDs across three services and then "
+        "proved it with a reproduction in staging. My other "
+        "strength is mentoring, I've onboarded four junior "
+        "engineers and I really enjoy code review as a teaching "
+        "tool rather than a gate."
+    ),
+    (
+        "The most challenging system I've built was a real-time "
+        "analytics pipeline processing around forty million "
+        "events a day. The hard part wasn't throughput, it was "
+        "correctness under failure. We used Kafka with "
+        "exactly-once semantics into a stream processor, and we "
+        "had to design idempotent consumers because upstream "
+        "producers could still replay events after network "
+        "partitions. I also had to make late-arriving data "
+        "visible without corrupting already-published daily "
+        "aggregates, which we solved with watermarking and a "
+        "correction topic. It taught me a lot about the "
+        "difference between a system that works in the demo and "
+        "one that survives a bad week in production."
+    ),
+    (
+        "When I approach a new problem I try to resist jumping "
+        "straight to a solution. I usually start by writing down "
+        "what I actually know versus what I'm assuming, and then "
+        "I look for the cheapest experiment that can invalidate "
+        "the riskiest assumption. For example, before we "
+        "committed to sharding our main database, I spent two "
+        "days proving with production query logs that eighty "
+        "percent of our load came from three query patterns that "
+        "a read replica plus better indexing could absorb. That "
+        "saved us a quarter of very painful migration work. I "
+        "also like to write a one-page design doc even for "
+        "medium-sized changes, mostly because the act of writing "
+        "exposes the gaps in my thinking."
+    ),
+    (
+        "On collaboration, I work most closely with product "
+        "managers, designers and our SRE team. The habit that "
+        "has served me best is over-communicating state: I keep "
+        "a running thread for every project with what shipped, "
+        "what's blocked and what decision I need next. With "
+        "product specifically I try to translate technical "
+        "trade-offs into user-visible terms, so instead of "
+        "saying a queue adds eventual consistency, I'll say the "
+        "receipt email may arrive up to a minute late, is that "
+        "acceptable. It makes prioritisation conversations much "
+        "faster and less adversarial."
+    ),
+    (
+        "In five years I'd like to be leading a small team, "
+        "maybe five or six engineers, while still writing code "
+        "myself, probably around a third of my time. I've had a "
+        "taste of that as a tech lead on the migration project "
+        "and I found I enjoy the multiplier effect, unblocking "
+        "people, shaping the architecture, and doing the "
+        "hands-on work on the gnarliest pieces. I'm deliberately "
+        "not aiming at pure people management yet, I think I "
+        "have a few more years of deep technical growth in me "
+        "first, especially around large-scale data systems."
+    ),
+    (
+        "Disagreements happen a lot in engineering and I think "
+        "that's healthy. My approach is to first make sure I can "
+        "state the other person's position well enough that they "
+        "would agree with my summary, because half the time the "
+        "disagreement dissolves right there. When it doesn't, I "
+        "try to convert opinions into testable claims. We had a "
+        "long argument about GraphQL versus REST for a partner "
+        "API, and we settled it by prototyping both against the "
+        "three most complex partner use cases and measuring "
+        "integration effort. REST won for our case, and the "
+        "person who had championed GraphQL wrote the decision "
+        "record, which kept the outcome blameless."
+    ),
+    (
+        "What motivates me most is seeing software I built get "
+        "used in the real world at meaningful scale. At the "
+        "payments company there's a dashboard showing live "
+        "transaction volume, and knowing my ledger service sits "
+        "under every one of those transactions is genuinely "
+        "satisfying. I'm also motivated by craft, I like leaving "
+        "a codebase measurably better than I found it, whether "
+        "that's cutting a flaky test suite's runtime in half or "
+        "deleting a thousand lines of dead configuration. And "
+        "honestly, I like working with people who care, energy "
+        "is contagious in both directions."
+    ),
+    (
+        "I think that covers my background well. To summarise, "
+        "six years of backend engineering, deep experience with "
+        "the microservices migration and the analytics pipeline "
+        "I described, strengths in distributed debugging and "
+        "mentoring, and I'm looking for a role where I can grow "
+        "into technical leadership. Thank you for the "
+        "conversation, Jamie, I've enjoyed the questions. I "
+        "don't have any further questions from my side."
+    ),
 ]
 
 
@@ -246,7 +383,11 @@ def ensure_answer_fixtures(count: int) -> list[Path]:
 
     for index in range(count):
         text = CANDIDATE_ANSWERS[index % len(CANDIDATE_ANSWERS)]
-        wav = FIXTURE_DIR / f"answer_{index + 1:02d}.wav"
+        # Content-hashed filename so edited answer TEXT
+        # invalidates the cache automatically (a stale cached
+        # clip would silently speak the OLD answer).
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+        wav = FIXTURE_DIR / f"answer_{index + 1:02d}_{digest}.wav"
 
         if not wav.exists():
             aiff = wav.with_suffix(".aiff")
@@ -1163,6 +1304,62 @@ async def body_new_lines(page, before: set[str]) -> list[str]:
     return ordered
 
 
+## Socket.io conclusion signals. The bot's closing sentence is
+## AUDIO-ONLY (no DOM text), so DOM detection alone misses the
+## concluding state; the room-api socket.io events are the
+## authoritative signal ("bot-speech-ended" carries isExit, and
+## the app broadcasts terminal interview states).
+_SOCKET_EXIT_MARKERS = (
+    '"isExit":true',
+    '"isExit": true',
+    '"isMoveToCodingAssessment":true',
+    '"isMoveToCodingAssessment": true',
+    "INTERVIEW_COMPLETED",
+    "INTERVIEW_ENDED",
+    "INTERVIEW_END",
+)
+
+
+def socket_exit_signalled(recorder: "PipelineRecorder") -> str | None:
+    """
+    Return the matching frame payload when the room-api
+    socket.io channel has signalled the interview concluded,
+    else None.
+    """
+
+    for frame in reversed(recorder.websocket_frames):
+        if "socket.io" not in (frame.get("url") or ""):
+            continue
+        payload = frame.get("payload") or ""
+        for marker in _SOCKET_EXIT_MARKERS:
+            if marker in payload:
+                return payload[:200]
+    return None
+
+
+async def interview_concluded(
+    page, recorder: "PipelineRecorder"
+) -> str | None:
+    """
+    Combined conclusion check used BEFORE injecting any
+    candidate turn and inside every failure path: returns a
+    human-readable reason when the interview has entered its
+    final/concluding state (socket.io exit signal or
+    end-of-interview UI), else None. After conclusion no
+    candidate audio may be injected and missing outbound RTP
+    is expected teardown, never an audio/bot failure.
+    """
+
+    exit_frame = socket_exit_signalled(recorder)
+    if exit_frame:
+        return f"socket.io exit signal: {exit_frame}"
+
+    if await detect_interview_complete(page):
+        return "end-of-interview text/UI rendered on the page"
+
+    return None
+
+
 async def detect_interview_complete(page) -> bool:
     """
     True when the interviewer has signalled the interview is
@@ -1771,6 +1968,14 @@ async def validate_greeting(
         + json.dumps(snapshot["remoteAudioTracks"])
     )
 
+    # Record the bot's remote audio from the very first
+    # utterance (greeting) for the stt-local fallback.
+    if await start_bot_audio_recording(page):
+        stages.stamp(
+            "[Turn 0] Remote-audio recording started (stt-local "
+            "capture)."
+        )
+
     # ----------------------------------------------------
     # Stage B: the published track must carry real audio.
     # Watch analyser energy AND inbound-rtp stats.
@@ -1988,6 +2193,7 @@ async def run_multi_turn(
     collector: TranscriptCollector,
     audio_records: list[dict],
     interview_status: dict | None = None,
+    audio_manifest: list[dict] | None = None,
 ) -> dict:
     # interview_status is mutated IN PLACE as turns complete so
     # the finally-block status sidecar is correct even when this
@@ -1997,6 +2203,8 @@ async def run_multi_turn(
     # completeness gating.
     if interview_status is None:
         interview_status = {}
+    if audio_manifest is None:
+        audio_manifest = []
 
     use_stats = not detector_ok
 
@@ -2014,17 +2222,41 @@ async def run_multi_turn(
         # Wait for the interviewer to finish its current question.
         await wait_for_bot_silence(page, watcher)
 
-        # Drive to REAL completion: stop once the interviewer has
-        # signalled the interview is over (unless a fixed turn
-        # count was forced for debugging).
+        # The bot utterance that just ended is fully recorded -
+        # persist it for the stt-local fallback (turn 1's
+        # predecessor is the greeting).
+        clip_label = (
+            "bot_turn_00_greeting"
+            if turn == 1
+            else f"bot_turn_{turn - 1:02d}"
+        )
+        saved_clip = await stop_bot_audio_recording(
+            page, clip_label
+        )
+        if saved_clip:
+            audio_manifest.append(
+                {
+                    "role": "assistant",
+                    "turn": turn - 1,
+                    "audio_path": str(saved_clip),
+                }
+            )
+
+        # Drive to REAL completion: stop once the interviewer
+        # has signalled the interview is over (unless a fixed
+        # turn count was forced for debugging). Checked BEFORE
+        # every injection - a candidate answer must never be
+        # spoken into a concluded interview.
         if FORCED_TURNS is None:
-            if await detect_interview_complete(page):
+            concluded = await interview_concluded(page, recorder)
+            if concluded:
                 turn -= 1
                 interview_complete = True
                 stages.stamp(
                     "Interview-complete signal detected after "
-                    f"{turn} candidate answer(s) - ending the "
-                    "drive-to-completion loop."
+                    f"{turn} candidate answer(s) ({concluded}) - "
+                    "ending the drive-to-completion loop "
+                    "cleanly, no further answers injected."
                 )
                 break
         elif turn > FORCED_TURNS:
@@ -2049,6 +2281,11 @@ async def run_multi_turn(
             "b => window.__emhSpeak(b)",
             fixture_base64(answer_wav),
         )
+
+        # Start recording the bot's REPLY to this answer (the
+        # remote track carries only bot audio, so starting now
+        # captures the full upcoming utterance).
+        await start_bot_audio_recording(page)
 
         # Stage 1: candidate mic - the injected clip must carry
         # energy on the fake microphone track (harness sanity).
@@ -2104,6 +2341,22 @@ async def run_multi_turn(
             f"sourceAudioLevel {out_after['sourceAudioLevel']})."
         )
         if sent_delta <= 0:
+            # If the interview concluded while (or just before)
+            # this answer played, the app legitimately tears
+            # down its published track: missing outbound RTP is
+            # expected teardown here, NOT an audio/bot failure.
+            concluded = await interview_concluded(page, recorder)
+            if concluded:
+                interview_complete = True
+                stages.stamp(
+                    f"[Turn {turn}] Interview concluded during "
+                    f"this answer ({concluded}) - outbound "
+                    "publish teardown is expected; ending the "
+                    "loop cleanly and marking the interview "
+                    "complete."
+                )
+                turn -= 1
+                break
             message = await capture_failure(
                 page, context, recorder, stages, run_dir,
                 label=f"CANDIDATE AUDIO NOT PUBLISHED AT TURN {turn}",
@@ -2195,6 +2448,16 @@ async def run_multi_turn(
                 "stt_transcript": app_stt_text or None,
                 "reference_segments": None,
                 "detected_segments": None,
+                "audio_path": str(answer_wav),
+            }
+        )
+        # The candidate clip actually injected this turn also
+        # feeds the stt-local transcript (genuine STT output of
+        # the audio the bot heard).
+        audio_manifest.append(
+            {
+                "role": "user",
+                "turn": turn,
                 "audio_path": str(answer_wav),
             }
         )
@@ -2316,6 +2579,21 @@ async def run_multi_turn(
         )
 
         if not responded:
+            # A bot that just DELIVERED its closing statement
+            # does not reply again: if the interview concluded
+            # during this turn, this is natural completion, not
+            # a freeze.
+            concluded = await interview_concluded(page, recorder)
+            if concluded:
+                interview_complete = True
+                stages.stamp(
+                    f"[Turn {turn}] No further bot reply and the "
+                    f"interview has concluded ({concluded}) - "
+                    "treating this as natural completion, not a "
+                    "response failure."
+                )
+                break
+
             # Distinguish "no reply at all" from "reply received
             # but not played" so a mid-interview freeze is not
             # blamed on the detector (and vice versa).
@@ -2441,6 +2719,17 @@ async def test_bot_greets_first_then_stays_responsive():
     except InterviewSessionError as error:
         pytest.fail(str(error))
 
+    # Session guards passed: clear the PREVIOUS session's
+    # capture artifacts so this run can never mix old and new
+    # transcripts/audio/status (a guard failure above leaves
+    # the last good run's evidence untouched).
+    removed = clear_previous_capture_artifacts()
+    if removed:
+        print(
+            f"Cleared {len(removed)} artifact(s) from the "
+            "previous capture run."
+        )
+
     # How many distinct candidate answers to synthesize (they
     # cycle for longer interviews). Driven to completion up to
     # MAX_TURNS, so pre-generate up to the answer-set size.
@@ -2462,6 +2751,7 @@ async def test_bot_greets_first_then_stays_responsive():
     turn_reports: list[dict] = []
     collector = TranscriptCollector()
     audio_records: list[dict] = []
+    audio_manifest: list[dict] = []
     interview_status = {
         "complete": False,
         "turns_completed": 0,
@@ -2484,9 +2774,11 @@ async def test_bot_greets_first_then_stays_responsive():
         )
         await context.add_init_script(INIT_SCRIPT)
         # Record LiveKit data-channel traffic (transcription/
-        # chat text, if the agent publishes any) - see
-        # collectors/transcript_capture.py.
+        # chat text, if the agent publishes any) and the bot's
+        # remote audio (per-turn, for the stt-local fallback) -
+        # see collectors/transcript_capture.py.
         await context.add_init_script(TRANSCRIPT_HOOK_JS)
+        await context.add_init_script(AUDIO_RECORD_JS)
         await context.tracing.start(screenshots=True, snapshots=True)
 
         page = await context.new_page()
@@ -2531,6 +2823,7 @@ async def test_bot_greets_first_then_stays_responsive():
                 fixtures, detector_ok, turn_reports,
                 collector, audio_records,
                 interview_status=interview_status,
+                audio_manifest=audio_manifest,
             )
 
             # A whole interview that never reached completion is a
@@ -2640,9 +2933,94 @@ async def test_bot_greets_first_then_stays_responsive():
                     "livekit_transcript_events.json"
                 )
             except Exception as error:
+                dc_events = []
                 print(
                     "LiveKit transcript hook drain failed "
                     f"(harness issue, not a bot failure): {error}"
+                )
+
+            # Persist the final bot utterance still being
+            # recorded (closing statement / last reply).
+            final_clip = await stop_bot_audio_recording(
+                page,
+                f"bot_turn_{interview_status['turns_completed']:02d}_final",
+            )
+            if final_clip:
+                audio_manifest.append(
+                    {
+                        "role": "assistant",
+                        "turn": interview_status["turns_completed"],
+                        "audio_path": str(final_clip),
+                    }
+                )
+
+            # Local Whisper over ALL captured audio (bot turns +
+            # the candidate clips actually injected) -> the
+            # stt-local capture backend. Environment-limited,
+            # never a test error.
+            try:
+                stt_summary = transcribe_captured_audio(
+                    audio_manifest
+                )
+                print(
+                    "stt-local transcription: "
+                    f"{stt_summary['transcribed']}/"
+                    f"{stt_summary['requested']} clips"
+                    + (
+                        f" (skipped: {stt_summary['skipped_reason']})"
+                        if stt_summary["skipped_reason"]
+                        else f" -> {stt_summary['path']}"
+                    )
+                )
+            except Exception as error:
+                stt_summary = {
+                    "requested": len(audio_manifest),
+                    "transcribed": 0,
+                    "skipped_reason": f"transcription error: {error}",
+                }
+                print(
+                    "stt-local transcription failed "
+                    f"(environment issue, not a bot failure): {error}"
+                )
+
+            # One evidence manifest per run: which sources
+            # produced usable bot text, which were empty.
+            try:
+                evidence = write_capture_evidence(
+                    dom_metadata=[
+                        {
+                            "role": captured.role,
+                            "content": captured.content,
+                        }
+                        for captured in collector.turns
+                    ],
+                    datachannel_events=dc_events,
+                    socketio_frames=[
+                        frame
+                        for frame in recorder.websocket_frames
+                        if "socket.io" in (frame.get("url") or "")
+                    ],
+                    audio_files=[
+                        entry["audio_path"]
+                        for entry in audio_manifest
+                        if entry["role"] == "assistant"
+                    ],
+                    stt_summary=stt_summary,
+                )
+                usable = [
+                    name
+                    for name, data in evidence["sources"].items()
+                    if data.get("usable_bot_text")
+                ]
+                print(
+                    "Capture evidence -> artifacts/"
+                    "capture_evidence.json | sources with usable "
+                    f"bot text: {usable or 'NONE'}"
+                )
+            except Exception as error:
+                print(
+                    "capture_evidence.json write failed "
+                    f"(harness issue): {error}"
                 )
 
             transcript_path = collector.save()

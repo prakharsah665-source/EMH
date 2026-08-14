@@ -68,7 +68,20 @@ def real_capture_turns(
     # An incomplete capture SKIPS (its bot/capture failure is
     # already reported upstream by the capture test); missing
     # or stale status FAILS at the capture/session layer.
-    verdict, reason = classify_status_for_scoring()
+    # load_status() reads the sidecar the capture run just
+    # wrote, so the classifier always sees the REAL current
+    # status object (printed for the report).
+    from evaluation.transcript_validation import load_status
+
+    status = load_status()
+    print(
+        f"[{test_label}] capture status: "
+        f"complete={status.complete}, "
+        f"turns={status.turn_count}, "
+        f"age={status.age_seconds and round(status.age_seconds)}s"
+    )
+
+    verdict, reason = classify_status_for_scoring(status)
     if verdict == "skip-upstream":
         pytest.skip(f"{test_label}: {reason}")
     if verdict != "ok":
