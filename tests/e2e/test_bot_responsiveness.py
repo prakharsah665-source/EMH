@@ -832,7 +832,11 @@ class PipelineRecorder:
                 if isinstance(payload, bytes):
                     body = f"<binary {len(payload)} bytes>"
                 else:
-                    body = mask_tokens(str(payload))[:300]
+                    # 2000 chars so text frames (socket.io
+                    # events) are recorded whole - the
+                    # socket.io transcript audit must be able
+                    # to rule text in/out conclusively.
+                    body = mask_tokens(str(payload))[:2000]
                 self.websocket_frames.append(
                     {
                         "ts": time.time() * 1000,
@@ -1983,7 +1987,17 @@ async def run_multi_turn(
     turn_reports: list[dict],
     collector: TranscriptCollector,
     audio_records: list[dict],
+    interview_status: dict | None = None,
 ) -> dict:
+    # interview_status is mutated IN PLACE as turns complete so
+    # the finally-block status sidecar is correct even when this
+    # function exits via pytest.fail mid-interview. Previously
+    # the sidecar recorded turn_count=0 for a run that froze at
+    # turn 11 - a lying status that broke downstream freshness/
+    # completeness gating.
+    if interview_status is None:
+        interview_status = {}
+
     use_stats = not detector_ok
 
     stages.stamp(
@@ -2385,6 +2399,10 @@ async def run_multi_turn(
         for line in pipe.lines():
             print(f"  {line}")
 
+        # Turn finished end-to-end: record it immediately so a
+        # later fail-fast still leaves a truthful sidecar.
+        interview_status["turns_completed"] = turn
+
     reached_cap = not interview_complete and turn >= MAX_TURNS
     if reached_cap:
         stages.stamp(
@@ -2399,11 +2417,10 @@ async def run_multi_turn(
             f"complete={interview_complete}."
         )
 
-    return {
-        "complete": interview_complete,
-        "turns_completed": turn,
-        "reached_cap": reached_cap,
-    }
+    interview_status["complete"] = interview_complete
+    interview_status["turns_completed"] = turn
+    interview_status["reached_cap"] = reached_cap
+    return interview_status
 
 
 # ============================================================
@@ -2505,10 +2522,15 @@ async def test_bot_greets_first_then_stays_responsive():
             # Phase 2: drive the FULL interview to completion.
             # Failures here are labelled BOT STOPPED RESPONDING AT
             # TURN N, never confused with a greeting failure.
-            interview_status = await run_multi_turn(
+            # interview_status (initialised above) is mutated IN
+            # PLACE per completed turn, so the finally-block
+            # sidecar stays truthful even on a mid-interview
+            # fail-fast.
+            await run_multi_turn(
                 page, context, recorder, stages, run_dir, watcher,
                 fixtures, detector_ok, turn_reports,
                 collector, audio_records,
+                interview_status=interview_status,
             )
 
             # A whole interview that never reached completion is a

@@ -37,6 +37,22 @@ _UI_NOISE = re.compile(
     re.IGNORECASE,
 )
 
+# Guided-tour / interview-room chrome: long prose-like lines
+# that pass the generic noise filter but are app UI, not the
+# bot speaking. Matched ANYWHERE in the line (the room status
+# bar concatenates them: "Frontend developer Elapsed time :
+# 01 secs AI is speaking Jamie (Interviewer) Welcome to Your
+# AI Interview Let's take a quick tour...").
+_UI_CHROME = re.compile(
+    r"elapsed time\s*:"
+    r"|ai is speaking"
+    r"|\(interviewer\)"
+    r"|welcome to your ai interview"
+    r"|take a quick tour"
+    r"|status indicators, controls",
+    re.IGNORECASE,
+)
+
 _MIN_CONTENT_CHARS = 12
 
 
@@ -51,6 +67,8 @@ def looks_like_conversation(line: str) -> bool:
     if len(line) < _MIN_CONTENT_CHARS:
         return False
     if _UI_NOISE.search(line):
+        return False
+    if _UI_CHROME.search(line):
         return False
     return True
 

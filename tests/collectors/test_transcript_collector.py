@@ -132,3 +132,30 @@ def test_audio_turn_records_roundtrip(tmp_path):
     assert save_audio_turn_records(records, path) == path
     assert json.loads(path.read_text()) == records
     assert save_audio_turn_records([], tmp_path / "e.json") is None
+
+
+def test_room_and_tour_chrome_is_never_bot_speech():
+    # The interview-room status bar + guided-tour copy is long
+    # and prose-like, so it used to pass the generic filter and
+    # get recorded as an assistant turn ("dom-greeting" chrome).
+    chrome = (
+        "Frontend developer Elapsed time : 01 secs AI is "
+        "speaking Jamie (Interviewer) Welcome to Your AI "
+        "Interview Let's take a quick tour of the interview "
+        "interface."
+    )
+    assert not looks_like_conversation(chrome)
+    assert not looks_like_conversation(
+        "You'll learn about the status indicators, controls, "
+        "and how to interact with the AI interviewer."
+    )
+    # Real interviewer speech still passes.
+    assert looks_like_conversation(
+        "Could you walk me through the most challenging bug "
+        "you have debugged recently?"
+    )
+
+    collector = TranscriptCollector()
+    assert collector.record_assistant_lines(
+        [chrome], source="dom-greeting", turn=0
+    ) == 0

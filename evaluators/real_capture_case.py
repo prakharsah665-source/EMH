@@ -27,6 +27,9 @@ from deepeval.metrics import GEval
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
 from collectors.transcript_capture import select_capture
+from evaluation.transcript_validation import (
+    classify_status_for_scoring,
+)
 from evaluators.consistent_geval import assert_metric_median
 from evaluators.nvidia_judge import get_nvidia_judge
 
@@ -59,6 +62,17 @@ def real_capture_turns(
     """
 
     floor = _CONFIDENCE_ORDER[min_confidence]
+
+    # Freshness/completeness gate BEFORE provenance filtering:
+    # scoring is allowed only for a fresh, complete capture.
+    # An incomplete capture SKIPS (its bot/capture failure is
+    # already reported upstream by the capture test); missing
+    # or stale status FAILS at the capture/session layer.
+    verdict, reason = classify_status_for_scoring()
+    if verdict == "skip-upstream":
+        pytest.skip(f"{test_label}: {reason}")
+    if verdict != "ok":
+        pytest.fail(f"{test_label}: {reason}")
 
     try:
         capture = select_capture()

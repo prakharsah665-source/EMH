@@ -73,3 +73,60 @@ def test_corrupt_ledger_is_treated_as_empty(ledger):
     # And marking still works (rewrites the file).
     mark_session_consumed(make_claims(), "y")
     assert consumed_session_entry(make_claims()) is not None
+
+
+# ============================================================
+# classify_status_for_scoring (evaluation/transcript_validation)
+# ============================================================
+
+import time as _time
+
+from evaluation.transcript_validation import (
+    TranscriptStatus,
+    classify_status_for_scoring,
+)
+
+
+def _status(complete, age_seconds):
+    captured = (
+        _time.time() - age_seconds
+        if age_seconds is not None
+        else None
+    )
+    return TranscriptStatus(
+        complete=complete,
+        turn_count=5,
+        reached_cap=False,
+        captured_at=captured,
+        age_seconds=age_seconds,
+    )
+
+
+def test_fresh_complete_capture_is_scorable():
+    verdict, _ = classify_status_for_scoring(_status(True, 60))
+    assert verdict == "ok"
+
+
+def test_incomplete_capture_skips_as_upstream_failure():
+    verdict, reason = classify_status_for_scoring(
+        _status(False, 60)
+    )
+    assert verdict == "skip-upstream"
+    assert "already reported" in reason
+    assert "test_bot_responsiveness" in reason
+
+
+def test_missing_status_fails_at_capture_layer():
+    verdict, reason = classify_status_for_scoring(
+        _status(None, None)
+    )
+    assert verdict == "fail-missing"
+    assert "CAPTURE" in reason
+
+
+def test_stale_capture_fails_even_if_complete():
+    verdict, reason = classify_status_for_scoring(
+        _status(True, 3 * 3600)
+    )
+    assert verdict == "fail-stale"
+    assert "refusing to score" in reason.lower()

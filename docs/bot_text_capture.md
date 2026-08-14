@@ -15,12 +15,22 @@ data-channel probe.
    Your AI Interview / Let's take a quick tour…") plus UI chrome ("Elapsed
    time", "AI is speaking", "Jamie (Interviewer)"). It exists before the
    agent says anything, so it is not a usable transcript source.
-3. **socket.io (`room-api-v1-dev…/socket.io/`) carries state, not text.**
-   Decoded event inventory from the run: `interview-state-change`,
-   `bot-speech-started`, `bot-speech-ended`, `user-speech-detected`,
-   `last-user-video-chunk`, `initiate-chat`, `fetch-job-candidate-details`,
-   `startInterview`, plus 812 outbound `USER_AUDIO_CHUNK` uploads (the
-   proctoring recorder). Zero transcript/caption/text payloads.
+3. **socket.io (`room-api-v1-dev…/socket.io/`) carries state, not text —
+   audited exhaustively, no backend warranted.** Full decode of every
+   frame from the 11-turn run: `interview-state-change` (99 sent / 23
+   received, `{"state": ...}` only), `bot-speech-started` /
+   `bot-speech-ended` (11 each, boolean flags only — these fire once per
+   bot utterance, so if the server attached utterance text anywhere it
+   would be here; the payloads are complete JSON with no text field),
+   `user-speech-detected` / `last-user-video-chunk` (null args),
+   `initiate-chat` / `startInterview` (JWT only),
+   `fetch-job-candidate-details` → `job-candidate-details` (candidate/job
+   METADATA — name, role — sent once at page load, not conversation). A
+   scan of every string field found zero multi-word conversation text.
+   Conclusion: socket.io is NOT an authoritative conversation-text
+   source; no transcript-capture backend was added for it. (The frame
+   recorder now keeps text frames to 2000 chars so future runs stay
+   conclusive.)
 4. **Browser console: audio-pipeline logs only** (chunk processing, state
    machine, watchdog) — no text.
 5. **LiveKit signalling WebSocket is binary protobuf**; transcriptions

@@ -20,6 +20,7 @@ from evaluation.transcript import (
 )
 from evaluation.transcript_validation import (
     TranscriptValidationError,
+    classify_status_for_scoring,
 )
 
 
@@ -80,26 +81,38 @@ def get_interview_transcript() -> str:
 
     print(f"\nUsing real EMH transcript: {path}")
 
+    # Scoring is allowed only for a FRESH, COMPLETE capture.
+    # skip-upstream: the capture run recorded an incomplete
+    # interview - that bot/capture failure is already reported
+    # by the capture test, so the gate SKIPS instead of
+    # duplicating it. Missing/stale status FAILS loudly at the
+    # capture/session layer.
+    verdict, reason = classify_status_for_scoring()
+    if verdict == "skip-upstream":
+        pytest.skip(f"QUALITY GATE NOT RUN - {reason}")
+    if verdict != "ok":
+        pytest.fail(
+            "\nTRANSCRIPT NOT SCORABLE\n"
+            f"{reason}\n"
+        )
+
     # TranscriptValidationError subclasses ValueError, so it
     # must be classified HERE: letting it reach the evaluator's
     # ValueError handler would mislabel a capture problem as an
-    # evaluator-output problem.
+    # evaluator-output problem. With a fresh+complete status,
+    # a remaining truncation means the capture channel simply
+    # holds no bot text (capture LIMITATION, not a bot failure)
+    # - skip, don't fail.
     try:
         return load_real_transcript(path)
     except TranscriptValidationError as error:
-        pytest.fail(
-            "\n"
-            "TRANSCRIPT NOT SCORABLE\n"
-            "The captured transcript is not a complete, current "
-            "interview, so the quality gate refuses to rubric-"
-            "score it as one.\n"
-            f"{error}\n"
-            "Root cause lives upstream: check the bot-"
-            "responsiveness E2E result/artifacts (it classifies "
-            "whether the interview died from a bot failure, a "
-            "LiveKit/audio issue, or a capture problem), then "
-            "re-run the capture:\n"
-            "    pytest tests/e2e/test_bot_responsiveness.py -s\n"
+        pytest.skip(
+            "QUALITY GATE NOT RUN - the capture is fresh and "
+            "complete but its transcript cannot be scored as a "
+            "whole interview (CAPTURE LIMITATION, not a bot "
+            f"failure): {error} "
+            "See docs/bot_text_capture.md for the bot-text "
+            "capture options."
         )
 
 

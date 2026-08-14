@@ -127,6 +127,70 @@ def validate_transcript_turns(
         )
 
 
+def classify_status_for_scoring(
+    status: TranscriptStatus | None = None,
+    max_age_seconds: int | None = None,
+) -> tuple[str, str]:
+    """
+    Decide how an AI-quality/rubric consumer should treat the
+    current capture status BEFORE scoring. Returns
+    (verdict, reason) with verdict one of:
+
+      "ok"            - fresh, complete capture: scoring allowed.
+      "skip-upstream" - the capture run recorded an INCOMPLETE
+                        interview: that upstream bot/capture
+                        failure is already reported by the
+                        capture test, so downstream scoring
+                        must SKIP instead of duplicating it.
+      "fail-missing"  - no status sidecar: provenance unknown,
+                        scoring must FAIL loudly (capture layer).
+      "fail-stale"    - the capture is older than the freshness
+                        window: scoring must FAIL loudly
+                        (session/capture layer), never silently
+                        reuse an old interview.
+    """
+
+    status = status or load_status()
+    if max_age_seconds is None:
+        max_age_seconds = MAX_AGE_SECONDS
+
+    if status.complete is None:
+        return (
+            "fail-missing",
+            "No capture status sidecar exists, so completeness "
+            "and freshness cannot be confirmed (CAPTURE layer). "
+            "Run the E2E capture: pytest tests/e2e/"
+            "test_bot_responsiveness.py -s",
+        )
+
+    if (
+        status.age_seconds is not None
+        and status.age_seconds > max_age_seconds
+    ):
+        return (
+            "fail-stale",
+            f"The capture is {status.age_seconds / 3600:.1f}h "
+            f"old (limit {max_age_seconds / 3600:.1f}h) - "
+            "refusing to score a PREVIOUS interview as the "
+            "current one (SESSION/CAPTURE layer). Re-run the "
+            "E2E capture with a fresh INTERVIEW_URL.",
+        )
+
+    if status.complete is False:
+        return (
+            "skip-upstream",
+            "The capture run recorded an INCOMPLETE interview "
+            f"(turns={status.turn_count}, "
+            f"reached_cap={status.reached_cap}). That upstream "
+            "bot/capture failure is already reported by "
+            "tests/e2e/test_bot_responsiveness.py - skipping "
+            "here instead of duplicating it as a quality "
+            "failure.",
+        )
+
+    return ("ok", "capture is fresh and complete")
+
+
 def transcript_status_line(
     turns: list[dict],
     status: TranscriptStatus | None = None,
