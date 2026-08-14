@@ -6,6 +6,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from config.settings import INTERVIEW_URL
+from pages.interview_launch import LAUNCH_BUTTON_RE
 
 
 # The interview link is configured centrally in .env and
@@ -154,9 +155,12 @@ async def test_socket_connection():
             # Start interview if required
             # -------------------------------------------------
 
+            # Accept BOTH "Start interview" and "Continue
+            # interview" - a session opened once before shows
+            # Continue (session state, not a missing button).
             start_button = page.get_by_role(
                 "button",
-                name="Start Interview",
+                name=LAUNCH_BUTTON_RE,
             )
 
             if await start_button.count() > 0:

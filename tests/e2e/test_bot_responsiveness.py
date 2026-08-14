@@ -94,7 +94,9 @@ from collectors.transcript_collector import (
 )
 from config.interview_session import (
     InterviewSessionError,
+    mark_session_consumed,
     require_fresh_interview_url,
+    require_unconsumed_session,
 )
 from config.settings import INTERVIEW_URL
 from pages.interview_launch import (
@@ -2410,6 +2412,11 @@ async def test_bot_greets_first_then_stays_responsive():
     # a reused dead room is not misread as a bot/audio failure.
     try:
         _url, claims = require_fresh_interview_url()
+        # Full-interview evaluation needs a room nobody joined
+        # before: the greeting fires on room join. A consumed
+        # session must fail as SESSION ALREADY CONSUMED
+        # (session/environment), never as a bot failure.
+        require_unconsumed_session(claims)
     except InterviewSessionError as error:
         pytest.fail(str(error))
 
@@ -2470,6 +2477,13 @@ async def test_bot_greets_first_then_stays_responsive():
             print("=" * 70)
 
             await launch_into_interview_room(page, stages)
+
+            # Room joined: the greeting fires now, so this
+            # session can never again serve as a fresh full
+            # interview - record it in the used-session ledger.
+            mark_session_consumed(
+                claims, "bot_responsiveness full interview"
+            )
 
             watcher = BotAudioWatcher(page)
 

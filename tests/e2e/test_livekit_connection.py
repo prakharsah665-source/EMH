@@ -4,10 +4,9 @@ import re
 import pytest
 from playwright.async_api import async_playwright
 
-from config.settings import INTERVIEW_URL
-from config.interview_session import (
-    InterviewSessionError,
-    require_fresh_interview_url,
+from tests.e2e.session_policy import (
+    mark_room_joined,
+    resolve_room_session,
 )
 
 
@@ -102,10 +101,12 @@ async def test_livekit_connection():
             "\n[1] Opening interview..."
         )
 
-        try:
-            interview_url, _claims = require_fresh_interview_url()
-        except InterviewSessionError as error:
-            pytest.fail(str(error))
+        # This test JOINS the interview room, so it needs an
+        # unconsumed session (skips or uses EMH_ROOM_TESTS_URL
+        # when the primary session's room was already joined).
+        interview_url, room_claims = resolve_room_session(
+            "test_livekit_connection"
+        )
 
         await page.goto(
             interview_url,
@@ -559,6 +560,7 @@ async def test_livekit_connection():
         )
 
         await continue_button.click()
+        mark_room_joined(room_claims, "test_livekit_connection")
 
         print(
             "Continue to Interview clicked."

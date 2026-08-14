@@ -21,11 +21,11 @@ real interview room actually loaded.
 import pytest
 from playwright.async_api import async_playwright
 
-from config.interview_session import (
-    InterviewSessionError,
-    require_fresh_interview_url,
-)
 from pages.interview_launch import launch_into_interview_room
+from tests.e2e.session_policy import (
+    mark_room_joined,
+    resolve_room_session,
+)
 
 
 # ============================================================
@@ -114,11 +114,13 @@ async def verify_interview_room(page):
 
 @pytest.mark.asyncio
 async def test_continue_to_interview():
-    # Fresh, non-stale, non-expired session (fail loudly otherwise).
-    try:
-        require_fresh_interview_url()
-    except InterviewSessionError as error:
-        pytest.fail(str(error))
+    # Fresh, non-stale, non-expired AND unconsumed session:
+    # this test JOINS the interview room, so it skips (or uses
+    # EMH_ROOM_TESTS_URL) when the primary session's room was
+    # already joined - see tests/e2e/session_policy.py.
+    room_url, room_claims = resolve_room_session(
+        "test_continue_to_interview"
+    )
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -142,7 +144,12 @@ async def test_continue_to_interview():
 
             # Shared launch: Start OR Continue, joyride, lock,
             # system config, speaker test, consent, Continue.
-            await launch_into_interview_room(page, log=print)
+            await launch_into_interview_room(
+                page, log=print, interview_url=room_url
+            )
+            mark_room_joined(
+                room_claims, "test_continue_to_interview"
+            )
 
             await verify_permissions(page)
             await verify_interview_room(page)

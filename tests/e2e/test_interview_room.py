@@ -5,6 +5,10 @@ from playwright.async_api import async_playwright
 
 from config.settings import INTERVIEW_URL
 from pages.interview_launch import LAUNCH_BUTTON_RE
+from tests.e2e.session_policy import (
+    mark_room_joined,
+    resolve_room_session,
+)
 
 
 def _interview_origin():
@@ -956,13 +960,12 @@ async def inspect_media_devices(page):
 @pytest.mark.asyncio
 async def test_interview_room():
 
-    if not INTERVIEW_URL:
-
-        pytest.fail(
-            "INTERVIEW_URL is not set.\n\n"
-            "Run:\n\n"
-            'export INTERVIEW_URL="YOUR_INTERVIEW_URL"'
-        )
+    # This test JOINS the interview room, so it needs an
+    # unconsumed session (skips or uses EMH_ROOM_TESTS_URL
+    # when the primary session's room was already joined).
+    room_url, room_claims = resolve_room_session(
+        "test_interview_room"
+    )
 
     async with async_playwright() as playwright:
 
@@ -996,7 +999,7 @@ async def test_interview_room():
             )
 
             await page.goto(
-                INTERVIEW_URL,
+                room_url,
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
@@ -1072,6 +1075,9 @@ async def test_interview_room():
 
             await click_continue_to_interview(
                 page
+            )
+            mark_room_joined(
+                room_claims, "test_interview_room"
             )
 
             # =================================================

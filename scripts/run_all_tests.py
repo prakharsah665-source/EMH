@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree
 import html
+import os
 import platform
 import subprocess
 import sys
@@ -125,22 +126,37 @@ def ordered_test_paths() -> list[str]:
        hits an already-finished interview and fails for
        session reasons, not product reasons.
 
-    So: setup-flow E2E first (freshest session), the capture
-    run last within E2E, then everything that judges the
-    fresh capture.
+    So: the full-interview evaluation FIRST - it is the only
+    consumer that needs a fresh, never-joined interview room
+    (the agent greeting fires on room join), and it produces
+    the capture everything else judges. Setup-screen tests
+    then re-enter the same session as intentional
+    continuation (they never join the room). Room-joining
+    tests (continue_to_interview / interview_room / livekit)
+    run last within E2E and skip with SESSION ALREADY
+    CONSUMED unless EMH_ROOM_TESTS_URL provides an isolated
+    second session. Judging suites come after the capture.
     """
 
     capture = ROOT / "tests/e2e/test_bot_responsiveness.py"
 
-    e2e_files = sorted(
+    room_joiners = [
+        ROOT / "tests/e2e/test_continue_to_interview.py",
+        ROOT / "tests/e2e/test_interview_room.py",
+        ROOT / "tests/e2e/test_livekit_connection.py",
+    ]
+
+    setup_screen_tests = sorted(
         path
         for path in (ROOT / "tests/e2e").glob("test_*.py")
-        if path != capture
+        if path != capture and path not in room_joiners
     )
 
     ordered = [
-        *e2e_files,
         capture,
+        *setup_screen_tests,
+        *room_joiners,
+        ROOT / "tests/config",
         ROOT / "tests/collectors",
         ROOT / "tests/audio_eval",
         ROOT / "tests/security",
@@ -681,6 +697,23 @@ so a single inconsistent judgment cannot fail the build.
 def main() -> int:
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # One fresh interview session per complete run: when a
+    # provisioning endpoint is configured (EMH_PROVISION_API_URL,
+    # see config/session_provisioner.py), mint the session here
+    # and hand it to every test via EMH_INTERVIEW_URL. Without
+    # one, the manually pasted INTERVIEW_URL/EMH_INTERVIEW_URL
+    # is used unchanged.
+    sys.path.insert(0, str(ROOT))
+    from config.session_provisioner import provision_interview_url
+
+    provisioned = provision_interview_url()
+    if provisioned:
+        os.environ["EMH_INTERVIEW_URL"] = provisioned
+        print(
+            "Provisioned a fresh interview session for this "
+            "run (URL withheld - it contains the JWT)."
+        )
 
     exit_code = run_pytest(sys.argv[1:])
 
