@@ -6,11 +6,14 @@ from playwright.async_api import async_playwright
 from evaluation.redaction import redact_pii
 from tests.e2e.screenshots import save_screenshot
 
-from config.settings import INTERVIEW_URL
+from config.interview_session import (
+    get_tests_url,
+    tests_url_configured,
+)
 from pages.interview_launch import LAUNCH_BUTTON_RE
 from config.interview_session import (
     InterviewSessionError,
-    require_fresh_interview_url,
+    require_fresh_tests_url,
 )
 
 
@@ -24,10 +27,10 @@ def _interview_origin():
     state at "prompt".
     """
 
-    if not INTERVIEW_URL:
+    if not tests_url_configured():
         return None
 
-    parts = urlparse(INTERVIEW_URL)
+    parts = urlparse(get_tests_url())
 
     return f"{parts.scheme}://{parts.netloc}"
 
@@ -571,13 +574,11 @@ async def test_recording_consent():
         Verify Continue button
     """
 
-    if not INTERVIEW_URL:
+    if not tests_url_configured():
 
         pytest.fail(
-            "INTERVIEW_URL is not set.\n\n"
-            "Run:\n\n"
-            'export INTERVIEW_URL="YOUR_INTERVIEW_URL"\n\n'
-            "Then run the test."
+            "No interview URL configured - set INTERVIEW_URL "
+            "(or the EMH_INTERVIEW_URL override)."
         )
 
     async with async_playwright() as playwright:
@@ -612,7 +613,7 @@ async def test_recording_consent():
             )
 
             try:
-                interview_url, _claims = require_fresh_interview_url()
+                interview_url, _claims = require_fresh_tests_url()
             except InterviewSessionError as error:
                 pytest.fail(str(error))
 

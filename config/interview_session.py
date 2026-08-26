@@ -107,14 +107,66 @@ def decode_interview_claims(url: str) -> InterviewClaims:
     )
 
 
-def get_interview_url() -> str:
+def _session_identity(url: str) -> tuple | None:
+    try:
+        claims = decode_interview_claims(url)
+    except InterviewSessionError:
+        return None
+    return (claims.candidate_id, claims.job_id, claims.issued_at)
+
+
+_split_config_warned = False
+
+
+def _warn_if_split_config(override: str | None, primary: str | None) -> None:
     """
-    Resolve the interview URL, honouring a per-run override
-    (EMH_INTERVIEW_URL takes precedence over INTERVIEW_URL so a
-    fresh session can be injected without editing .env).
+    Warn LOUDLY (once per process) when INTERVIEW_URL and
+    EMH_INTERVIEW_URL are both set but point at DIFFERENT
+    sessions. EMH_INTERVIEW_URL is a per-run override for the
+    CLI/provisioner - it must not live in .env next to
+    INTERVIEW_URL, because it silently wins and any test that
+    read the raw INTERVIEW_URL would open a different session
+    than the full-interview evaluation.
     """
 
-    url = os.getenv("EMH_INTERVIEW_URL") or INTERVIEW_URL
+    global _split_config_warned
+    if _split_config_warned or not override or not primary:
+        return
+    if override == primary:
+        return
+    if _session_identity(override) == _session_identity(primary):
+        return
+    _split_config_warned = True
+    print(
+        "[WARNING] INTERVIEW_URL and EMH_INTERVIEW_URL are BOTH set "
+        "and decode to DIFFERENT interview sessions. "
+        "EMH_INTERVIEW_URL (per-run override) WINS for every "
+        "test; the INTERVIEW_URL session will be ignored. Keep "
+        "ONE primary URL (remove EMH_INTERVIEW_URL from .env; use "
+        "it only as a CLI/provisioner override) so the full "
+        "interview, setup tests, transcript and evaluation all "
+        "use the same session.",
+        flush=True,
+    )
+
+
+def get_interview_url() -> str:
+    """
+    Resolve the PRIMARY interview URL - reserved EXCLUSIVELY for
+    the full-interview evaluation (tests/e2e/test_bot_responsiveness).
+
+    EMH_INTERVIEW_URL is a per-run override (set by the CLI or
+    by the session provisioner in scripts/run_all_tests.py) and
+    takes precedence over INTERVIEW_URL (.env). Every other E2E
+    test uses the separate EMH_TESTS_URL session (see
+    get_tests_url) so nothing ever shares - or runs concurrently
+    against - the full-interview session (the app has a one-tab
+    session lock; a second joiner ejects the first).
+    """
+
+    override = os.getenv("EMH_INTERVIEW_URL")
+    _warn_if_split_config(override, INTERVIEW_URL)
+    url = override or INTERVIEW_URL
     if not url:
         raise InterviewSessionError(
             "No interview URL configured. Set INTERVIEW_URL (or "
@@ -123,33 +175,97 @@ def get_interview_url() -> str:
     return url
 
 
-def require_fresh_interview_url() -> tuple[str, InterviewClaims]:
+def interview_url_configured() -> bool:
+    """True when a primary interview URL is configured at all."""
+
+    return bool(os.getenv("EMH_INTERVIEW_URL") or INTERVIEW_URL)
+
+
+def get_tests_url() -> str:
     """
-    Return a validated (url, claims). Raises InterviewSessionError
-    for a missing, stale-demo or expired session so every test
-    starts from a known-fresh room.
+    Resolve the SECOND fresh session used by every isolated
+    room/LiveKit/setup-screen E2E test (EMH_TESTS_URL; the older
+    EMH_ROOM_TESTS_URL name is still honoured). Never the same
+    session as INTERVIEW_URL.
     """
 
-    url = get_interview_url()
+    url = os.getenv("EMH_TESTS_URL") or os.getenv("EMH_ROOM_TESTS_URL")
+    if not url:
+        raise InterviewSessionError(
+            "EMH_TESTS_URL is not configured. Isolated E2E tests "
+            "(setup screens / interview room / LiveKit) run ONLY "
+            "on their own fresh session so they can never share "
+            "or eject the full-interview session (INTERVIEW_URL). "
+            "Paste a second fresh interview URL into EMH_TESTS_URL."
+        )
+    return url
+
+
+def tests_url_configured() -> bool:
+    return bool(os.getenv("EMH_TESTS_URL") or os.getenv("EMH_ROOM_TESTS_URL"))
+
+
+def _validate_fresh(url: str, var_name: str) -> InterviewClaims:
     claims = decode_interview_claims(url)
 
     if claims.is_stale_demo and not ALLOW_STALE:
         raise InterviewSessionError(
             "Refusing to run against the STALE demo interview "
-            f"(candidate {STALE_CANDIDATE_ID} / job {STALE_JOB_ID}). "
-            "Paste a FRESH interview URL into INTERVIEW_URL (or set "
-            "EMH_INTERVIEW_URL). Reusing this dead session is the "
-            "root cause of the downstream LiveKit/audio/recording/"
-            "config failures. Set EMH_ALLOW_STALE_INTERVIEW=1 only "
-            "to deliberately debug against it."
+            f"(candidate {STALE_CANDIDATE_ID} / job {STALE_JOB_ID}) "
+            f"configured in {var_name}. Paste a FRESH interview URL. "
+            "Reusing this dead session is the root cause of the "
+            "downstream LiveKit/audio/recording/config failures. "
+            "Set EMH_ALLOW_STALE_INTERVIEW=1 only to deliberately "
+            "debug against it."
         )
 
     if claims.is_expired and not ALLOW_STALE:
         raise InterviewSessionError(
-            "The configured interview JWT is EXPIRED "
-            f"(exp={claims.expires_at}). Paste a fresh interview "
-            "URL into INTERVIEW_URL / EMH_INTERVIEW_URL."
+            f"The interview JWT in {var_name} is EXPIRED "
+            f"(exp={claims.expires_at}). Paste a fresh interview URL."
         )
+
+    return claims
+
+
+def require_fresh_interview_url() -> tuple[str, InterviewClaims]:
+    """
+    Return the validated PRIMARY (url, claims) for the full-
+    interview evaluation. Raises InterviewSessionError for a
+    missing, stale-demo or expired session.
+    """
+
+    url = get_interview_url()
+    claims = _validate_fresh(url, "INTERVIEW_URL / EMH_INTERVIEW_URL")
+    return url, claims
+
+
+def require_fresh_tests_url() -> tuple[str, InterviewClaims]:
+    """
+    Return the validated TESTS (url, claims) for isolated E2E
+    tests. Raises InterviewSessionError when missing, stale,
+    expired, or identical to the primary full-interview session
+    (the two must never be the same room).
+    """
+
+    url = get_tests_url()
+    claims = _validate_fresh(url, "EMH_TESTS_URL")
+
+    if interview_url_configured() and not ALLOW_STALE:
+        primary = _session_identity(get_interview_url())
+        if primary == (
+            claims.candidate_id, claims.job_id, claims.issued_at
+        ):
+            raise InterviewSessionError(
+                "EMH_TESTS_URL points at the SAME session as "
+                "INTERVIEW_URL (candidate "
+                f"{claims.candidate_id} / job {claims.job_id}). "
+                "The full-interview evaluation and the isolated "
+                "E2E tests must use two DIFFERENT fresh sessions - "
+                "the app's one-tab lock ejects the first joiner "
+                "otherwise. Paste a second fresh URL into "
+                "EMH_TESTS_URL."
+            )
 
     return url, claims
 

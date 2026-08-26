@@ -32,6 +32,20 @@ MAX_AGE_SECONDS = int(os.getenv("EMH_TRANSCRIPT_MAX_AGE_SECONDS", "7200"))
 MIN_ASSISTANT_TURNS = 2
 MIN_USER_TURNS = 1
 
+# Capture-coverage floor: even when the drive COMPLETED the
+# interview (status.complete=True with turn_count driven
+# candidate turns), the capture channel may have caught only a
+# fraction of it. Judging that fragment as "the whole interview"
+# penalizes the interviewer for turns that happened but were not
+# captured. Captured candidate turns must cover at least this
+# fraction of the driven turns. Kept below 1.0 deliberately:
+# the collector de-duplicates repeated content (cycled candidate
+# answers on long interviews legitimately collapse), so exact
+# equality is not achievable.
+MIN_CAPTURE_COVERAGE = float(
+    os.getenv("EMH_MIN_CAPTURE_COVERAGE", "0.5")
+)
+
 
 class TranscriptValidationError(ValueError):
     """The transcript is empty, stale or truncated - do not score."""
@@ -44,6 +58,12 @@ class TranscriptStatus:
     reached_cap: bool | None
     captured_at: float | None
     age_seconds: float | None
+    # Why an incomplete interview ended, when known: the room/
+    # server tearing the connection down is an environment
+    # condition and must be reported as such, not as an agent
+    # that silently died.
+    room_disconnected: bool | None = None
+    conclusion_reason: str | None = None
 
 
 def load_status(
@@ -52,7 +72,16 @@ def load_status(
     path = Path(path)
     if not path.exists():
         return TranscriptStatus(None, None, None, None, None)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # A corrupt/unreadable sidecar means provenance is
+        # UNKNOWN - same as no sidecar. Crashing here would
+        # surface as an unclassified evaluator error instead of
+        # a capture-layer verdict.
+        return TranscriptStatus(None, None, None, None, None)
+    if not isinstance(data, dict):
+        return TranscriptStatus(None, None, None, None, None)
     captured_at = data.get("captured_at")
     age = (
         time.time() - captured_at
@@ -65,6 +94,44 @@ def load_status(
         reached_cap=data.get("reached_cap"),
         captured_at=captured_at,
         age_seconds=age,
+        room_disconnected=data.get("room_disconnected"),
+        conclusion_reason=data.get("conclusion_reason"),
+    )
+
+
+def capture_coverage_problem(
+    user_turns: int,
+    status: TranscriptStatus,
+    *,
+    min_coverage: float = MIN_CAPTURE_COVERAGE,
+) -> str | None:
+    """
+    Cross-check the captured transcript against what the drive
+    actually did. status.turn_count is the number of candidate
+    turns the E2E run DROVE; user_turns is how many the capture
+    channel actually caught. When coverage is too low, the
+    transcript is a fragment of a longer interview - a captured
+    turn proves that exchange happened, but a MISSING turn never
+    proves it did not - so judging the fragment as the whole
+    interview is invalid. Returns a human-readable problem, or
+    None when coverage is acceptable/unknowable.
+    """
+
+    driven = status.turn_count
+    if not driven or driven <= 0:
+        return None
+    coverage = user_turns / driven
+    if coverage >= min_coverage:
+        return None
+    return (
+        f"Capture coverage too low: the drive completed {driven} "
+        f"candidate turn(s) but only {user_turns} were captured "
+        f"({coverage:.0%} < required {min_coverage:.0%}). The "
+        "transcript is a FRAGMENT of the interview - judging it "
+        "as the whole interview would penalize turns that "
+        "happened but were not captured (CAPTURE LIMITATION, "
+        "not a bot failure). Override the floor with "
+        "EMH_MIN_CAPTURE_COVERAGE if deliberate."
     )
 
 
@@ -115,6 +182,14 @@ def validate_transcript_turns(
                 "the E2E capture (tests/e2e/test_bot_responsiveness"
                 ".py) or set require_complete=False deliberately."
             )
+
+        # A complete DRIVE with a fragmentary CAPTURE must not be
+        # judged as the whole interview either.
+        coverage_problem = capture_coverage_problem(
+            user_turns, status
+        )
+        if coverage_problem:
+            raise TranscriptValidationError(coverage_problem)
 
     # --- staleness --------------------------------------------
     if status.age_seconds is not None and status.age_seconds > max_age_seconds:
@@ -177,15 +252,28 @@ def classify_status_for_scoring(
         )
 
     if status.complete is False:
+        if status.room_disconnected:
+            cause = (
+                "the ROOM/SERVER disconnected mid-interview "
+                "(environment condition, not an agent or "
+                "candidate failure)"
+            )
+        elif status.reached_cap:
+            cause = (
+                "the safety cap was hit without a conclusion "
+                "signal (agent dead, over-long or looping)"
+            )
+        else:
+            cause = "it never reached a conclusion signal"
         return (
             "skip-upstream",
             "The capture run recorded an INCOMPLETE interview "
             f"(turns={status.turn_count}, "
-            f"reached_cap={status.reached_cap}). That upstream "
-            "bot/capture failure is already reported by "
+            f"reached_cap={status.reached_cap}): {cause}. That "
+            "upstream failure is already reported by "
             "tests/e2e/test_bot_responsiveness.py - skipping "
             "here instead of duplicating it as a quality "
-            "failure.",
+            "failure. A truncated interview is never scored.",
         )
 
     return ("ok", "capture is fresh and complete")

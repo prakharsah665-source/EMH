@@ -67,12 +67,40 @@ Classification:
   already-driven URL now fails at the session layer instead of producing
   fake bot failures. (Residual risk: consumption by parties outside this
   harness is not detectable from the launch page.)
-- **Room-joining tests** resolve their session via
-  `tests/e2e/session_policy.py`: unconsumed primary session → use it;
-  consumed → use `EMH_ROOM_TESTS_URL` (isolated second session) if provided,
-  else **skip** with `SESSION ALREADY CONSUMED` — never a red "bot" failure.
-- **Manual URLs preserved.** `INTERVIEW_URL` (.env) and the
-  `EMH_INTERVIEW_URL` override behave exactly as before.
+- **Two sessions per run (2026-08-17).** `INTERVIEW_URL` is reserved
+  EXCLUSIVELY for `test_bot_responsiveness`; **every other E2E test** uses
+  `EMH_TESTS_URL` (legacy name `EMH_ROOM_TESTS_URL` still honoured) via
+  `require_fresh_tests_url()` / `tests/e2e/session_policy.py`. Setup-screen
+  tests re-enter it as continuation. `require_fresh_tests_url()` fails if it
+  is the same session as `INTERVIEW_URL`.
+- **One shared room join per run (2026-08-24).** The three room-joining
+  tests (`test_continue_to_interview`, `test_interview_room`,
+  `test_livekit_connection`) share a SINGLE join of `EMH_TESTS_URL`
+  (`tests/e2e/shared_room.py` + the `shared_room` fixture in
+  `tests/e2e/conftest.py`): the first to run joins through the unchanged
+  policy (unconsumed session required; join ledgered), the others attach
+  to the same live page and validate their own responsibility, and the
+  browser leaves the room gracefully exactly once after the last of them.
+  Previously each test joined on its own, so with a budget of one joinable
+  session per run the second and third skipped `SESSION ALREADY CONSUMED`
+  deterministically. That skip now only occurs when `EMH_TESTS_URL` was
+  consumed *before* the run (the guard is re-checked per consumer).
+- **No concurrent runs on one session.** The app has a one-tab lock (a
+  second joiner ejects the first — seen live 2026-08-17). `config/session_lock.py`
+  + `tests/e2e/conftest.py` hold a per-session pid lock for each E2E test;
+  a live holder → `SESSION IN USE` (environment). `scripts/run_all_tests.py`
+  runs a **pre-flight** requiring both URLs fresh, distinct, unused and
+  unlocked (override with `EMH_ALLOW_STALE_INTERVIEW=1`).
+- **ONE primary URL.** `INTERVIEW_URL` (.env) is the primary session.
+  `EMH_INTERVIEW_URL` is a per-run override for the CLI/provisioner ONLY -
+  never put it in `.env` next to `INTERVIEW_URL`. Every test resolves the URL
+  via `config.interview_session.get_interview_url()` /
+  `require_fresh_interview_url()` (no test reads `config.settings.INTERVIEW_URL`
+  directly), so the full interview, setup-screen tests, transcript and
+  evaluation always target the SAME session. If both vars are set to
+  different sessions, `get_interview_url()` prints a loud `[WARNING]` naming
+  the winner (fixed 2026-08-17: `.env` had two links, so 4 setup tests silently
+  opened a different candidate than the evaluated interview).
 - **Provisioner hook.** `config/session_provisioner.py` mints a per-run
   session when `EMH_PROVISION_API_URL` is configured
   (`scripts/run_all_tests.py` exports it as `EMH_INTERVIEW_URL` for the
@@ -95,5 +123,5 @@ Content-Type: application/json
 The returned URL must embed the standard interview JWT
 (`candidate_id/job_id/company_id/iat/exp`) so the existing freshness,
 expiry and used-session guards work unchanged. Optional env:
-`EMH_PROVISION_JOB_ID` (job to mint against), `EMH_ROOM_TESTS_URL`
-(isolated second session for room-joining tests).
+`EMH_PROVISION_JOB_ID` (job to mint against), `EMH_TESTS_URL`
+(the isolated second session for all non-full-interview E2E tests).

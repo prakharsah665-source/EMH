@@ -5,16 +5,24 @@ from urllib.parse import urlsplit, parse_qs, urlencode, urlunsplit
 import pytest
 from playwright.async_api import async_playwright
 
-from config.settings import INTERVIEW_URL
+from config.interview_session import (
+    InterviewSessionError,
+    get_tests_url,
+)
 from pages.interview_launch import LAUNCH_BUTTON_RE
 
 
-# The interview link is configured centrally in .env and
-# surfaced via config.settings - no hard-coded fallback.
-BASE_URL = os.getenv(
-    "BASE_URL",
-    INTERVIEW_URL,
-)
+# The interview link is resolved centrally (EMH_INTERVIEW_URL
+# override or INTERVIEW_URL) - the same session every other
+# test uses. BASE_URL remains an explicit escape hatch.
+def resolve_base_url() -> str:
+    explicit = os.getenv("BASE_URL")
+    if explicit:
+        return explicit
+    try:
+        return get_tests_url()
+    except InterviewSessionError:
+        return ""
 
 
 def mask_websocket_url(url: str) -> str:
@@ -59,6 +67,13 @@ async def test_socket_connection():
     print("\n========================================")
     print("SOCKET CONNECTION TEST")
     print("========================================")
+
+    base_url = resolve_base_url()
+    if not base_url:
+        pytest.fail(
+            "No interview URL configured - set INTERVIEW_URL "
+            "(or the EMH_INTERVIEW_URL / BASE_URL override)."
+        )
 
     async with async_playwright() as p:
 
@@ -138,7 +153,7 @@ async def test_socket_connection():
             )
 
             await page.goto(
-                BASE_URL,
+                base_url,
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )

@@ -57,6 +57,18 @@ auto`), PII-redacted at capture time (`evaluation/redaction.py`):
 | `DomScrapeCapture` (stopgap) | Existing DOM capture metadata; honest confidences: `app-stt` high, `dom-diff` medium, `dom-greeting`/`injected-audio` low | Working today (but yields ~no assistant text, per finding 1) |
 | `SttCapture` (fallback) | Local STT over recorded bot audio | Documented, not implemented — the capture run does not record bot audio to disk yet |
 
+## Provenance (confidence levels per source)
+
+| Source | Confidence | Why |
+|---|---|---|
+| `livekit-<label>` (string JSON payload) | high | LiveKit chat / `lk.transcription` text as published, identity-tagged. |
+| `livekit-candidate-stt` (binary, `candidate-*` marker) | high | The EMH agent's **own** STT of the candidate - the authoritative record of what the bot *heard*. |
+| `livekit-agent-session` (binary, `agent-*`/unattributed) | high (promoted 2026-08-21, was medium) | The agent session streams the text of each bot utterance as cumulative captions. This is the text the agent emitted (its TTS input), not a transcription of its audio by the harness - the authoritative record of what the bot *said*. Same class as `livekit-candidate-stt`; the earlier "medium" rating reflected the binary *extraction* risk, which is now mitigated by framing-token filtering and the 5-sentence-word gate. It is still the only bot-text source that can satisfy `min_confidence="high"` (technical_accuracy). |
+| `app-stt` | high | Candidate text rendered by the app from its own STT. |
+| `stt-local` | medium | Harness-side Whisper over recorded bot audio: real, but a second transcription layer that can normalise wording. |
+| `dom-diff` | medium | Page text diff; role attribution is heuristic. |
+| `dom-greeting`, `injected-audio` | low | What the harness played/expected, never what the app produced/heard. |
+
 `test_bot_responsiveness` now installs the hook and prints
 `LiveKit data-channel transcript hook: N events, M with text` at the end of
 every capture, so the channel question is answered on every run.

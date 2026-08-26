@@ -1,17 +1,18 @@
 from urllib.parse import urlparse
 
 import pytest
-from playwright.async_api import async_playwright
 
 from evaluation.redaction import redact_pii
 from tests.e2e.screenshots import save_screenshot
 
-from config.settings import INTERVIEW_URL
-from pages.interview_launch import LAUNCH_BUTTON_RE
-from tests.e2e.session_policy import (
-    mark_room_joined,
-    resolve_room_session,
+# tests_url_configured is aliased so pytest's test* collection
+# pattern does not pick the imported helper up as a phantom
+# always-passing "test".
+from config.interview_session import (
+    get_tests_url,
+    tests_url_configured as _tests_url_configured,
 )
+from pages.interview_launch import LAUNCH_BUTTON_RE
 
 
 def _interview_origin():
@@ -24,10 +25,10 @@ def _interview_origin():
     state at "prompt".
     """
 
-    if not INTERVIEW_URL:
+    if not _tests_url_configured():
         return None
 
-    parts = urlparse(INTERVIEW_URL)
+    parts = urlparse(get_tests_url())
 
     return f"{parts.scheme}://{parts.netloc}"
 
@@ -960,199 +961,114 @@ async def inspect_media_devices(page):
 # MAIN TEST
 # ============================================================
 
-@pytest.mark.asyncio
-async def test_interview_room():
+@pytest.mark.asyncio(loop_scope="session")
+async def test_interview_room(shared_room):
 
-    # This test JOINS the interview room, so it needs an
-    # unconsumed session (skips or uses EMH_ROOM_TESTS_URL
-    # when the primary session's room was already joined).
-    room_url, room_claims = resolve_room_session(
-        "test_interview_room"
-    )
+    # Attaches to the run's SINGLE shared EMH_TESTS_URL room
+    # join (tests/e2e/shared_room.py) - the session budget is
+    # one joinable room per run, so the three room-join tests
+    # share it instead of each consuming/skipping. The
+    # setup-screen walk this test used to duplicate is owned by
+    # the dedicated setup tests (system_configuration /
+    # audio_configuration / recording_consent) and by the shared
+    # launch's own per-step post-conditions; this test's
+    # responsibility is the interview ROOM itself.
+    page = await shared_room.ensure_joined("test_interview_room")
 
-    async with async_playwright() as playwright:
+    try:
 
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--use-fake-device-for-media-stream",
-                "--use-fake-ui-for-media-stream",
-            ],
+        print()
+        print("=" * 70)
+        print(
+            "INTERVIEW ROOM TEST"
+        )
+        print("=" * 70)
+
+        # =================================================
+        # 1. Permissions
+        # =================================================
+
+        await verify_permissions(
+            page
         )
 
-        context = await browser.new_context()
+        # =================================================
+        # 2. Actual Media
+        # =================================================
 
-        page = await context.new_page()
+        await verify_media_access(
+            page
+        )
+
+        # =================================================
+        # 3. Interview Room
+        # =================================================
+
+        await verify_interview_room(
+            page
+        )
+
+        # =================================================
+        # 4. Video
+        # =================================================
+
+        await verify_video_element(
+            page
+        )
+
+        # =================================================
+        # 5. Audio
+        # =================================================
+
+        await verify_audio_elements(
+            page
+        )
+
+        # =================================================
+        # 6. Media Devices
+        # =================================================
+
+        await inspect_media_devices(
+            page
+        )
+
+        # =================================================
+        # 7. Screenshot
+        # =================================================
+
+        await save_screenshot(
+            page, "interview_room"
+        )
+
+        # =================================================
+        # FINAL PASS
+        # =================================================
+
+        print()
+        print("=" * 70)
+        print(
+            "INTERVIEW ROOM TEST PASSED"
+        )
+        print("=" * 70)
+
+    except Exception:
+
+        await print_page_state(
+            page,
+            "INTERVIEW ROOM TEST FAILED",
+        )
 
         try:
 
-            print()
-            print("=" * 70)
-            print(
-                "INTERVIEW ROOM TEST"
-            )
-            print("=" * 70)
-
-            # =================================================
-            # 1. Open Interview
-            # =================================================
-
-            print(
-                "Opening interview URL..."
-            )
-
-            await page.goto(
-                room_url,
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-
-            print(
-                "Interview page loaded."
-            )
-
-            print(
-                "URL:",
-                page.url,
-            )
-
-            await page.wait_for_timeout(
-                2000
-            )
-
-            # =================================================
-            # 2. Permissions
-            # =================================================
-
-            await grant_permissions(
-                context
-            )
-
-            await verify_permissions(
-                page
-            )
-
-            # =================================================
-            # 3. Actual Media
-            # =================================================
-
-            await verify_media_access(
-                page
-            )
-
-            # =================================================
-            # 4. Start Interview
-            # =================================================
-
-            await click_start_interview(
-                page
-            )
-
-            # =================================================
-            # 5. System Configuration
-            # =================================================
-
-            await verify_system_configuration(
-                page
-            )
-
-            # =================================================
-            # 6. Audio Configuration
-            # =================================================
-
-            await complete_audio_configuration(
-                page
-            )
-
-            # =================================================
-            # 7. Recording Consent
-            # =================================================
-
-            await accept_recording_consent(
-                page
-            )
-
-            # =================================================
-            # 8. Continue
-            # =================================================
-
-            await click_continue_to_interview(
-                page
-            )
-            mark_room_joined(
-                room_claims, "test_interview_room"
-            )
-
-            # =================================================
-            # 9. Interview Room
-            # =================================================
-
-            await verify_interview_room(
-                page
-            )
-
-            # =================================================
-            # 10. Video
-            # =================================================
-
-            await verify_video_element(
-                page
-            )
-
-            # =================================================
-            # 11. Audio
-            # =================================================
-
-            await verify_audio_elements(
-                page
-            )
-
-            # =================================================
-            # 12. Media Devices
-            # =================================================
-
-            await inspect_media_devices(
-                page
-            )
-
-            # =================================================
-            # 13. Screenshot
-            # =================================================
-
             await save_screenshot(
-                page, "interview_room"
+                page, "interview_room_failed"
             )
-
-            # =================================================
-            # FINAL PASS
-            # =================================================
-
-            print()
-            print("=" * 70)
-            print(
-                "INTERVIEW ROOM TEST PASSED"
-            )
-            print("=" * 70)
 
         except Exception:
+            pass
 
-            await print_page_state(
-                page,
-                "INTERVIEW ROOM TEST FAILED",
-            )
+        raise
 
-            try:
-
-                await save_screenshot(
-                    page, "interview_room_failed"
-                )
-
-            except Exception:
-                pass
-
-            raise
-
-        finally:
-
-            await context.close()
-            await browser.close()
+    # No finally-teardown here: the shared_room fixture leaves
+    # the room gracefully and closes the browser exactly once,
+    # after the LAST room-join test (tests/e2e/conftest.py).

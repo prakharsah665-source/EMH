@@ -1,15 +1,22 @@
 import pytest
 from playwright.async_api import async_playwright
 
-from config.settings import INTERVIEW_URL
+from config.interview_session import (
+    InterviewSessionError,
+    require_fresh_tests_url,
+)
 
 
 @pytest.mark.asyncio
 async def test_interview_launch():
 
-    assert INTERVIEW_URL, (
-        "INTERVIEW_URL is missing from .env"
-    )
+    # Resolve the ONE primary session (EMH_INTERVIEW_URL override
+    # or INTERVIEW_URL) - never read the raw .env value, so this
+    # smoke test opens the same session as the full interview.
+    try:
+        interview_url, _claims = require_fresh_tests_url()
+    except InterviewSessionError as error:
+        pytest.fail(str(error))
 
     async with async_playwright() as playwright:
 
@@ -27,7 +34,7 @@ async def test_interview_launch():
         page = await context.new_page()
 
         response = await page.goto(
-            INTERVIEW_URL,
+            interview_url,
             wait_until="domcontentloaded",
         )
 

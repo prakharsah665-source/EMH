@@ -130,3 +130,121 @@ def test_stale_capture_fails_even_if_complete():
     )
     assert verdict == "fail-stale"
     assert "refusing to score" in reason.lower()
+
+
+# ============================================================
+# URL resolution: ONE primary session, split-config warning
+# ============================================================
+
+import base64
+import json
+
+
+def _url(candidate, job, iat):
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {"candidate_id": candidate, "job_id": job,
+             "company_id": 3, "iat": iat,
+             "exp": int(__import__("time").time()) + 100_000}
+        ).encode()
+    ).rstrip(b"=").decode()
+    return f"https://x.test/interview/h.{payload}.s?version=v1"
+
+
+@pytest.fixture
+def clean_url_env(monkeypatch):
+    monkeypatch.delenv("EMH_INTERVIEW_URL", raising=False)
+    monkeypatch.setattr(interview_session, "_split_config_warned", False)
+    yield monkeypatch
+
+
+def test_override_wins_over_primary(clean_url_env, capsys):
+    primary, override = _url(1, 2, 100), _url(9, 2, 200)
+    clean_url_env.setattr(interview_session, "INTERVIEW_URL", primary)
+    clean_url_env.setenv("EMH_INTERVIEW_URL", override)
+    assert interview_session.get_interview_url() == override
+    assert "DIFFERENT interview sessions" in capsys.readouterr().out
+
+
+def test_no_warning_when_only_primary(clean_url_env, capsys):
+    primary = _url(1, 2, 100)
+    clean_url_env.setattr(interview_session, "INTERVIEW_URL", primary)
+    assert interview_session.get_interview_url() == primary
+    assert "DIFFERENT" not in capsys.readouterr().out
+    assert interview_session.interview_url_configured()
+
+
+def test_no_warning_when_both_same_session(clean_url_env, capsys):
+    url = _url(1, 2, 100)
+    clean_url_env.setattr(interview_session, "INTERVIEW_URL", url)
+    clean_url_env.setenv("EMH_INTERVIEW_URL", url)
+    interview_session.get_interview_url()
+    assert "DIFFERENT" not in capsys.readouterr().out
+
+
+def test_missing_url_raises(clean_url_env):
+    clean_url_env.setattr(interview_session, "INTERVIEW_URL", None)
+    assert not interview_session.interview_url_configured()
+    with pytest.raises(InterviewSessionError):
+        interview_session.get_interview_url()
+
+
+# ============================================================
+# Two-session setup: EMH_TESTS_URL + cross-process lock
+# ============================================================
+
+def test_tests_url_must_differ_from_primary(clean_url_env):
+    url = _url(1, 2, 100)
+    clean_url_env.setattr(interview_session, "INTERVIEW_URL", url)
+    clean_url_env.setenv("EMH_TESTS_URL", url)
+    with pytest.raises(InterviewSessionError, match="SAME session"):
+        interview_session.require_fresh_tests_url()
+
+
+def test_tests_url_resolves_separately(clean_url_env):
+    clean_url_env.setattr(interview_session, "INTERVIEW_URL", _url(1, 2, 100))
+    clean_url_env.setenv("EMH_TESTS_URL", _url(9, 2, 200))
+    url, claims = interview_session.require_fresh_tests_url()
+    assert claims.candidate_id == 9
+    assert interview_session.require_fresh_interview_url()[1].candidate_id == 1
+
+
+def test_missing_tests_url_raises(clean_url_env):
+    clean_url_env.delenv("EMH_TESTS_URL", raising=False)
+    clean_url_env.delenv("EMH_ROOM_TESTS_URL", raising=False)
+    assert not interview_session.tests_url_configured()
+    with pytest.raises(InterviewSessionError, match="EMH_TESTS_URL"):
+        interview_session.get_tests_url()
+
+
+def test_legacy_room_tests_url_still_honoured(clean_url_env):
+    clean_url_env.delenv("EMH_TESTS_URL", raising=False)
+    clean_url_env.setenv("EMH_ROOM_TESTS_URL", _url(9, 2, 200))
+    assert interview_session.get_tests_url().endswith("?version=v1")
+
+
+def test_session_lock_blocks_live_holder_and_takes_over_stale(tmp_path, monkeypatch):
+    import json, os
+    from config import session_lock
+    monkeypatch.setattr(session_lock, "LOCK_DIR", tmp_path)
+    claims = make_claims()
+
+    with session_lock.acquire_session_lock(claims, "run A") as path:
+        assert path.exists()
+        # Same pid re-enters fine.
+        with session_lock.acquire_session_lock(claims, "run A again"):
+            pass
+        assert path.exists()
+        # A different LIVE pid is refused.
+        record = json.loads(path.read_text())
+        record["pid"] = os.getppid()  # a live pid that is not us
+        path.write_text(json.dumps(record))
+        with pytest.raises(InterviewSessionError, match="SESSION IN USE"):
+            with session_lock.acquire_session_lock(claims, "run B"):
+                pass
+        # A dead pid is stale and taken over.
+        record["pid"] = 999_999_999
+        path.write_text(json.dumps(record))
+        with session_lock.acquire_session_lock(claims, "run C"):
+            assert json.loads(path.read_text())["holder"] == "run C"
+    assert not path.exists()

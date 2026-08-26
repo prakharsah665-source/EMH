@@ -32,19 +32,34 @@ Phase 1 - TURN 0 / GREETING VALIDATION
     candidate VAD, TTS produced no audio, token/permission
     prevented publishing, or a test-harness detection problem).
 
-Phase 2 - MULTI-TURN RESPONSIVENESS (6 turns by default)
+Phase 2 - FULL INTERVIEW, DRIVEN UNTIL THE BOT CONCLUDES IT
     Only after the greeting is verified does the candidate start
     answering. Per turn: inject a synthesized spoken answer into
-    the fake microphone, then require an audible bot reply within
-    BOT_RESPONSE_TIMEOUT_S. A failure here is reported as
-    "BOT STOPPED RESPONDING AT TURN N" - explicitly distinct from
-    a greeting failure.
+    the fake microphone, then expect an audible bot reply within
+    BOT_RESPONSE_TIMEOUT_S. There is NO fixed turn count: the
+    evaluator stays in the interview room until the AI
+    interviewer itself concludes the interview (socket.io exit
+    signal / end-of-interview UI). A missing reply is recorded as
+    a DEFERRED failure ("BOT STOPPED RESPONDING AT TURN N" with
+    the full pipeline diagnostics) - it never ends the interview:
+    the evaluator waits BOT_RECOVERY_TIMEOUT_S for a late reply,
+    then re-speaks the answer, and repeats until the bot answers
+    or concludes (bounded only by the INTERVIEW_MAX_S wall-clock
+    safety cap). Deferred failures are reported AFTER the
+    interview concludes, with the transcript marked complete.
 
 Candidate audio never comes from a human microphone: an init
 script replaces navigator.mediaDevices.getUserMedia with a
-WebAudio MediaStreamDestination the test feeds on demand, using
-answers synthesized once with macOS `say` into
-data/audio_fixtures/*.wav.
+WebAudio MediaStreamDestination the test feeds on demand. The
+candidate's words come from the LLM CandidateSimulator
+(simulator/candidate_simulator.py): every turn the ACTUAL
+interviewer question is read from the live caption stream
+(simulator/live_answers.py), the simulator answers it in its
+hidden persona (EMH_TEST_MODE=competency, default) or executes
+the adversarial spec (EMH_TEST_MODE=robustness), and the answer
+is synthesized with macOS `say` into artifacts/audio/candidate/.
+There is NO scripted answer bank on this path: if a valid live
+question cannot be read the drive fails with the reason.
 
 On any failure the test dumps: room name and identities (decoded
 from the LiveKit access-token JWT in the signalling WebSocket
@@ -75,11 +90,9 @@ Run with the existing command:
 
 import asyncio
 import base64
-import hashlib
 import json
 import os
 import re
-import subprocess
 import time
 import urllib.parse
 from datetime import datetime
@@ -109,26 +122,66 @@ from config.interview_session import (
     require_fresh_interview_url,
     require_unconsumed_session,
 )
-from config.settings import INTERVIEW_URL
 from pages.interview_launch import (
     launch_into_interview_room as _launch_shared,
 )
+from simulator.candidate_simulator import CandidateSimulator
+from simulator.live_answers import (
+    LiveQuestionUnavailable,
+    LiveSimulatorAnswerSource,
+    ScriptedAnswerSource,
+)
+from simulator.personas import PERSONAS
+from simulator.role_context import role_context_from_frame_rows
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-# The interview is driven to REAL completion (the bot signalling
-# it is done), not a fixed question count. MAX_TURNS is a safety
-# cap so a never-ending / looping agent cannot hang the test.
-# EMH_INTERVIEW_TURNS, if set, still forces an exact turn count
-# (kept for backwards-compatible single-question debugging).
-MAX_TURNS = max(1, min(40, int(os.getenv("EMH_MAX_TURNS", "25"))))
-_FORCED_TURNS = os.getenv("EMH_INTERVIEW_TURNS")
-FORCED_TURNS = (
-    max(1, min(MAX_TURNS, int(_FORCED_TURNS))) if _FORCED_TURNS else None
+# The interview is driven to REAL completion: the evaluator stays
+# in the room until the AI interviewer itself concludes the
+# interview (socket.io exit signal / end-of-interview UI). There
+# is NO fixed question/turn count - the only bound is a wall-
+# clock safety cap so a dead or looping agent cannot hang CI
+# forever. EMH_MAX_TURNS (default 0 = unlimited) remains an
+# optional hard cap; EMH_INTERVIEW_TURNS still forces an exact
+# turn count for single-question debugging.
+INTERVIEW_MAX_S = int(os.getenv("EMH_INTERVIEW_MAX_S", str(45 * 60)))
+MAX_TURNS = max(0, int(os.getenv("EMH_MAX_TURNS", "0")))  # 0 = no cap
+
+# After the interviewer's exit signal, keep the page alive for a
+# bounded grace period so the app can finish its completion flow
+# (end-interview / interview_exit exchange, final media-chunk
+# flush, completion UI / status update) before teardown. 0
+# disables the wait.
+POST_EXIT_GRACE_S = max(
+    0.0, float(os.getenv("EMH_POST_EXIT_GRACE_S", "25"))
 )
+_FORCED_TURNS = os.getenv("EMH_INTERVIEW_TURNS")
+FORCED_TURNS = max(1, int(_FORCED_TURNS)) if _FORCED_TURNS else None
+
+# Mid-interview stall recovery. A bot that does not answer within
+# BOT_RESPONSE_TIMEOUT_S is NOT terminal: the evaluator records
+# the stall (full diagnostics), keeps waiting in the room for
+# BOT_RECOVERY_TIMEOUT_S for a late reply, then re-speaks the
+# candidate answer (the app's own watchdog returns to
+# USER_WAITING, so a re-prompt is the natural recovery) and
+# repeats until the bot answers, concludes, or INTERVIEW_MAX_S
+# is exhausted. Recorded stalls are reported AFTER the interview
+# concludes, never by ending it early.
+BOT_RECOVERY_TIMEOUT_S = int(os.getenv("EMH_BOT_RECOVERY_TIMEOUT", "120"))
+
+# The ONE non-bot terminal condition besides the safety caps: the
+# server tears the room down (LiveKit peer connections closed /
+# socket.io "transport close") WITHOUT a conclusion signal and
+# never reconnects within this grace period. Re-prompting into a
+# dead page cannot recover; the drive exits and the transcript is
+# marked incomplete with an ENVIRONMENT classification. Set
+# EMH_ROOM_DISCONNECT_GRACE=0 to disable (stay until the wall-
+# clock cap even in a dead room).
+ROOM_DISCONNECT_GRACE_S = int(os.getenv("EMH_ROOM_DISCONNECT_GRACE", "180"))
+ROOM_DISCONNECTED = "ROOM DISCONNECTED BY SERVER (no conclusion signal)"
 
 # Phrases with which the interviewer signals the interview is
 # over. Kept specific so a mid-interview "thank you" does not
@@ -183,7 +236,6 @@ AGENT_JOINED_BUT_NO_AUDIO = "AGENT JOINED BUT NO AUDIO"
 TTS_AUDIO_PUBLISH_FAILED = "TTS/AUDIO PUBLISH FAILED"
 DETECTOR_FAILED = "BOT AUDIO RECEIVED BUT DETECTOR FAILED"
 
-FIXTURE_DIR = Path("data/audio_fixtures")
 SCREENSHOT_DIR = Path("artifacts/screenshots")
 DEBUG_ROOT = Path("artifacts/debug")
 REPORT_DIR = Path("artifacts/reports")
@@ -204,150 +256,12 @@ AGENT_ERROR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Candidate answers spoken into the fake microphone AFTER the
-# greeting, one per turn (cycled if TURNS exceeds the list).
-# Deliberately LONG and interview-realistic (multiple points,
-# concrete examples, natural asides) so the evaluation
-# exercises long-context STT -> AI -> TTS behaviour, follow-up
-# grounding, context retention and stability across the whole
-# interview - not just one-liner turn-taking.
-CANDIDATE_ANSWERS = [
-    (
-        "Hello Jamie, thank you, it's nice to meet you. I'm Alex, "
-        "a software engineer with about six years of experience, "
-        "mostly on backend systems in Python and Node. I started "
-        "out at a logistics startup where I built order-tracking "
-        "APIs, and for the last three years I've been at a "
-        "payments company where I own the transaction-processing "
-        "services. Along the way I've picked up a lot of "
-        "operational experience too, things like on-call, "
-        "observability and capacity planning, and I genuinely "
-        "enjoy the reliability side of engineering as much as the "
-        "feature side."
-    ),
-    (
-        "The project I'm proudest of recently is a migration of "
-        "our payments monolith to microservices. We had a single "
-        "Django application handling everything from checkout to "
-        "reconciliation, and deployments had become genuinely "
-        "risky, a bad release could block refunds for hours. I "
-        "led the effort to carve out the highest-risk domains "
-        "first, starting with the ledger service. We used the "
-        "strangler pattern, kept a compatibility layer so the "
-        "monolith and the new services could co-exist, and moved "
-        "traffic over gradually with feature flags. After about "
-        "nine months our deployment frequency went from weekly "
-        "to daily and rollbacks became a five-minute operation "
-        "instead of an incident."
-    ),
-    (
-        "I'd say my biggest strength is debugging complex "
-        "distributed problems calmly. A good example is a "
-        "duplicate-charge bug we saw roughly once in every "
-        "hundred thousand transactions. It turned out to be a "
-        "retry storm caused by a load balancer timeout that was "
-        "shorter than our downstream payment provider's p99 "
-        "latency, so a small percentage of requests were retried "
-        "while the original was still in flight. I found it by "
-        "correlating trace IDs across three services and then "
-        "proved it with a reproduction in staging. My other "
-        "strength is mentoring, I've onboarded four junior "
-        "engineers and I really enjoy code review as a teaching "
-        "tool rather than a gate."
-    ),
-    (
-        "The most challenging system I've built was a real-time "
-        "analytics pipeline processing around forty million "
-        "events a day. The hard part wasn't throughput, it was "
-        "correctness under failure. We used Kafka with "
-        "exactly-once semantics into a stream processor, and we "
-        "had to design idempotent consumers because upstream "
-        "producers could still replay events after network "
-        "partitions. I also had to make late-arriving data "
-        "visible without corrupting already-published daily "
-        "aggregates, which we solved with watermarking and a "
-        "correction topic. It taught me a lot about the "
-        "difference between a system that works in the demo and "
-        "one that survives a bad week in production."
-    ),
-    (
-        "When I approach a new problem I try to resist jumping "
-        "straight to a solution. I usually start by writing down "
-        "what I actually know versus what I'm assuming, and then "
-        "I look for the cheapest experiment that can invalidate "
-        "the riskiest assumption. For example, before we "
-        "committed to sharding our main database, I spent two "
-        "days proving with production query logs that eighty "
-        "percent of our load came from three query patterns that "
-        "a read replica plus better indexing could absorb. That "
-        "saved us a quarter of very painful migration work. I "
-        "also like to write a one-page design doc even for "
-        "medium-sized changes, mostly because the act of writing "
-        "exposes the gaps in my thinking."
-    ),
-    (
-        "On collaboration, I work most closely with product "
-        "managers, designers and our SRE team. The habit that "
-        "has served me best is over-communicating state: I keep "
-        "a running thread for every project with what shipped, "
-        "what's blocked and what decision I need next. With "
-        "product specifically I try to translate technical "
-        "trade-offs into user-visible terms, so instead of "
-        "saying a queue adds eventual consistency, I'll say the "
-        "receipt email may arrive up to a minute late, is that "
-        "acceptable. It makes prioritisation conversations much "
-        "faster and less adversarial."
-    ),
-    (
-        "In five years I'd like to be leading a small team, "
-        "maybe five or six engineers, while still writing code "
-        "myself, probably around a third of my time. I've had a "
-        "taste of that as a tech lead on the migration project "
-        "and I found I enjoy the multiplier effect, unblocking "
-        "people, shaping the architecture, and doing the "
-        "hands-on work on the gnarliest pieces. I'm deliberately "
-        "not aiming at pure people management yet, I think I "
-        "have a few more years of deep technical growth in me "
-        "first, especially around large-scale data systems."
-    ),
-    (
-        "Disagreements happen a lot in engineering and I think "
-        "that's healthy. My approach is to first make sure I can "
-        "state the other person's position well enough that they "
-        "would agree with my summary, because half the time the "
-        "disagreement dissolves right there. When it doesn't, I "
-        "try to convert opinions into testable claims. We had a "
-        "long argument about GraphQL versus REST for a partner "
-        "API, and we settled it by prototyping both against the "
-        "three most complex partner use cases and measuring "
-        "integration effort. REST won for our case, and the "
-        "person who had championed GraphQL wrote the decision "
-        "record, which kept the outcome blameless."
-    ),
-    (
-        "What motivates me most is seeing software I built get "
-        "used in the real world at meaningful scale. At the "
-        "payments company there's a dashboard showing live "
-        "transaction volume, and knowing my ledger service sits "
-        "under every one of those transactions is genuinely "
-        "satisfying. I'm also motivated by craft, I like leaving "
-        "a codebase measurably better than I found it, whether "
-        "that's cutting a flaky test suite's runtime in half or "
-        "deleting a thousand lines of dead configuration. And "
-        "honestly, I like working with people who care, energy "
-        "is contagious in both directions."
-    ),
-    (
-        "I think that covers my background well. To summarise, "
-        "six years of backend engineering, deep experience with "
-        "the microservices migration and the analytics pipeline "
-        "I described, strengths in distributed debugging and "
-        "mentoring, and I'm looking for a role where I can grow "
-        "into technical leadership. Thank you for the "
-        "conversation, Jamie, I've enjoyed the questions. I "
-        "don't have any further questions from my side."
-    ),
-]
+# Candidate answers: generated live per turn by the CandidateSimulator
+# from the ACTUAL interviewer question (see simulator/live_answers.py).
+# Mode/persona selection for the live drive:
+TEST_MODE = os.getenv("EMH_TEST_MODE", "competency").lower()
+SIMULATOR_PERSONA = os.getenv("EMH_SIMULATOR_PERSONA", "average").lower()
+SIMULATOR_TURNS_PATH = Path("artifacts/transcripts/simulator_turns.json")
 
 
 def now_stamp() -> str:
@@ -367,61 +281,8 @@ class StageLog:
 
 
 # ============================================================
-# Audio fixtures (no human microphone)
+# Audio injection (no human microphone)
 # ============================================================
-
-def ensure_answer_fixtures(count: int) -> list[Path]:
-    """
-    Synthesize spoken candidate answers as mono 48 kHz WAV files
-    using macOS `say` + `afconvert`. Cached in
-    data/audio_fixtures/ so generation happens once.
-    """
-
-    FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
-
-    fixtures = []
-
-    for index in range(count):
-        text = CANDIDATE_ANSWERS[index % len(CANDIDATE_ANSWERS)]
-        # Content-hashed filename so edited answer TEXT
-        # invalidates the cache automatically (a stale cached
-        # clip would silently speak the OLD answer).
-        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
-        wav = FIXTURE_DIR / f"answer_{index + 1:02d}_{digest}.wav"
-
-        if not wav.exists():
-            aiff = wav.with_suffix(".aiff")
-
-            try:
-                subprocess.run(
-                    ["say", "-o", str(aiff), text],
-                    check=True,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    [
-                        "afconvert",
-                        "-f", "WAVE",
-                        "-d", "LEI16@48000",
-                        "-c", "1",
-                        str(aiff),
-                        str(wav),
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
-            except (OSError, subprocess.CalledProcessError) as error:
-                pytest.skip(
-                    "Could not synthesize candidate audio fixtures "
-                    f"with macOS say/afconvert: {error}"
-                )
-            finally:
-                aiff.unlink(missing_ok=True)
-
-        fixtures.append(wav)
-
-    return fixtures
-
 
 def fixture_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
@@ -485,6 +346,21 @@ INIT_SCRIPT = """
         ev('mic_created');
     }
 
+    // The currently playing fake-mic source, so setup-screen
+    // audio can be explicitly stopped before the room is joined.
+    let activeMicSource = null;
+
+    // Stop any clip still playing on the fake microphone.
+    // Returns true when something was actually stopped.
+    // stop() fires the source's onended, so the pending
+    // __emhSpeak promise resolves and mic.playing clears.
+    window.__emhStopSpeak = () => {
+        if (!activeMicSource) return false;
+        try { activeMicSource.stop(); } catch (e) {}
+        activeMicSource = null;
+        return true;
+    };
+
     // Play a base64 WAV into the fake microphone. Resolves with
     // the clip duration (ms) once playback finishes.
     window.__emhSpeak = async (base64Wav) => {
@@ -507,10 +383,12 @@ INIT_SCRIPT = """
                 durationMs: Math.round(buffer.duration * 1000),
             });
             source.onended = () => {
+                if (activeMicSource === source) activeMicSource = null;
                 state.mic.playing = false;
                 ev('candidate_audio_end');
                 resolve(Math.round(buffer.duration * 1000));
             };
+            activeMicSource = source;
             source.start();
         });
     };
@@ -874,8 +752,9 @@ INIT_SCRIPT = """
 def mask_tokens(text: str) -> str:
     # The interview URL itself embeds a session JWT - never let
     # it into logs or failure output.
-    if INTERVIEW_URL:
-        text = text.replace(INTERVIEW_URL, "<INTERVIEW_URL>")
+    for url in {os.getenv("EMH_INTERVIEW_URL"), os.getenv("INTERVIEW_URL")}:
+        if url:
+            text = text.replace(url, "<INTERVIEW_URL>")
     return re.sub(
         r"(token|access_token|authorization)=[^&\s\"']+",
         r"\1=***REDACTED***",
@@ -1739,27 +1618,37 @@ async def capture_failure(
     likely_causes: list[str],
     turn_reports: list[dict] | None = None,
     pipeline: TurnPipeline | None = None,
+    keep_trace: bool = False,
+    screenshot_name: str = "bot_responsiveness_failed.png",
 ) -> str:
     """
     Save screenshot, trace and all collected logs, and build a
     failure message with the classification label first and full
     diagnostics after it.
+
+    keep_trace=True captures the diagnostics for a NON-terminal
+    (deferred) failure while the interview keeps running: the
+    Playwright trace stays open so the rest of the interview is
+    still traced, and the screenshot gets its own name.
     """
 
     run_dir.mkdir(parents=True, exist_ok=True)
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-    screenshot = SCREENSHOT_DIR / "bot_responsiveness_failed.png"
+    screenshot = SCREENSHOT_DIR / screenshot_name
     try:
         await page.screenshot(path=str(screenshot), full_page=True)
     except Exception:
         screenshot = None
 
     trace_path = run_dir / "trace.zip"
-    try:
-        await context.tracing.stop(path=str(trace_path))
-    except Exception:
-        trace_path = None
+    if keep_trace:
+        trace_path = f"{trace_path} (still recording - saved at exit)"
+    else:
+        try:
+            await context.tracing.stop(path=str(trace_path))
+        except Exception:
+            trace_path = None
 
     recorder.save(run_dir)
 
@@ -1863,6 +1752,48 @@ async def capture_failure(
 
 
 # ============================================================
+# Deferred failures
+#
+# The evaluator never leaves the interview room because of a
+# bot-response failure: every classified failure that used to
+# call pytest.fail() mid-interview is recorded here with its
+# full diagnostics and reported AFTER the AI interviewer has
+# concluded the interview (or the wall-clock cap is hit).
+# ============================================================
+
+def defer_failure(
+    deferred: list[dict],
+    stages: StageLog,
+    *,
+    turn: int,
+    label: str,
+    message: str,
+    attempt: int = 1,
+) -> None:
+    deferred.append(
+        {
+            "turn": turn,
+            "attempt": attempt,
+            "label": label,
+            "message": message,
+            "recorded_at": time.time(),
+            "recovered": False,
+        }
+    )
+    stages.stamp(
+        f"[Turn {turn}] DEFERRED FAILURE #{len(deferred)}: {label} "
+        "- diagnostics captured; STAYING IN THE ROOM (the "
+        "interview ends only when the AI interviewer concludes "
+        "it)."
+    )
+    print()
+    print("-" * 70)
+    print(f"DEFERRED (non-terminal) FAILURE at turn {turn}: {label}")
+    print(message)
+    print("-" * 70)
+
+
+# ============================================================
 # Phase 1: Turn 0 - greeting validation
 #
 # The bot must speak FIRST. No candidate audio is injected here.
@@ -1876,14 +1807,20 @@ async def validate_greeting(
     run_dir: Path,
     watcher: BotAudioWatcher,
     collector: TranscriptCollector,
+    deferred: list[dict] | None = None,
 ) -> bool:
     """
     Verify Jamie's automatic greeting. Returns True if the
     analyser heard the greeting, False if only WebRTC stats
     confirmed it (detector failed - later turns fall back to
-    stats-based detection). Calls pytest.fail with a classified
-    message if the greeting never arrived.
+    stats-based detection) OR if the greeting never arrived - in
+    that case the classified failure is DEFERRED (recorded with
+    full diagnostics) and the evaluator stays in the room so the
+    multi-turn loop can prompt the bot and let it recover.
     """
+
+    if deferred is None:
+        deferred = []
 
     stages.stamp(
         "[Turn 0] Expecting the bot to speak FIRST - no candidate "
@@ -1959,8 +1896,14 @@ async def validate_greeting(
                 "agent worker logs for this room name.",
             ],
             pipeline=pipe,
+            keep_trace=True,
+            screenshot_name="bot_responsiveness_turn00_stall.png",
         )
-        pytest.fail(message)
+        defer_failure(
+            deferred, stages, turn=0, label=AGENT_NEVER_JOINED,
+            message=message,
+        )
+        return False
 
     snapshot = await rtc_snapshot(page)
     stages.stamp(
@@ -2172,13 +2115,165 @@ async def validate_greeting(
         page, context, recorder, stages, run_dir,
         label=label, reason=reason, likely_causes=causes,
         pipeline=pipe,
+        keep_trace=True,
+        screenshot_name="bot_responsiveness_turn00_stall.png",
     )
-    pytest.fail(message)
+    defer_failure(
+        deferred, stages, turn=0, label=label, message=message
+    )
+    return False
 
 
 # ============================================================
 # Phase 2: multi-turn responsiveness (after the greeting)
 # ============================================================
+
+def room_gone(snapshot: dict) -> bool:
+    """
+    True when the browser's LiveKit peer connection(s) are all
+    closed/failed/disconnected and no remote audio track is
+    live - i.e. the server tore the room down.
+    """
+
+    states = snapshot.get("connectionStates") or []
+    if not states:
+        return False
+    dead = {"closed", "failed", "disconnected"}
+    if any(
+        (st.get("connection") or "") not in dead for st in states
+    ):
+        return False
+    return not any(
+        track.get("readyState") == "live"
+        for track in snapshot.get("remoteAudioTracks", [])
+    )
+
+
+async def wait_for_late_reply(
+    page,
+    watcher: BotAudioWatcher,
+    recorder: PipelineRecorder,
+    use_stats: bool,
+    timeout_s: float,
+    room_state: dict | None = None,
+) -> tuple[bool, str | None]:
+    """
+    Recovery wait after a stall: stay in the room and keep
+    polling for a LATE bot reply or an interview-conclusion
+    signal for up to timeout_s. Returns (heard, concluded).
+
+    room_state (shared across attempts) tracks how long the room
+    has been torn down; once ROOM_DISCONNECT_GRACE_S is exceeded
+    room_state["disconnected"] is set and the wait returns early
+    so the caller can leave with the ENVIRONMENT classification.
+    """
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = await watcher.poll()
+        if result["analyser_heard"] or (
+            use_stats and result["stats_heard"]
+        ):
+            if room_state is not None:
+                room_state.pop("gone_since", None)
+            return True, None
+        concluded = await interview_concluded(page, recorder)
+        if concluded:
+            return False, concluded
+        if room_state is not None and ROOM_DISCONNECT_GRACE_S > 0:
+            if room_gone(result["snapshot"]):
+                room_state.setdefault("gone_since", time.monotonic())
+                if (
+                    time.monotonic() - room_state["gone_since"]
+                    >= ROOM_DISCONNECT_GRACE_S
+                ):
+                    room_state["disconnected"] = True
+                    return False, None
+            else:
+                room_state.pop("gone_since", None)
+        await asyncio.sleep(1.0)
+    return False, None
+
+
+async def post_exit_grace(
+    page,
+    recorder: "PipelineRecorder",
+    stages: StageLog,
+    run_dir: Path,
+) -> dict:
+    """
+    Bounded wait AFTER the interviewer's exit signal, BEFORE
+    teardown: the interview is over (no further turns are
+    driven), but the app still needs the page to finish its
+    completion flow. Observes the post-exit socket.io traffic
+    (end-interview / interview_exit, final media chunk with
+    isSegmentComplete:true) and the completion UI, ends early
+    once completion is confirmed, and always ends at the
+    POST_EXIT_GRACE_S bound. The post-exit frames are dumped to
+    run_dir/post_exit_frames.jsonl as completion evidence.
+    """
+
+    summary = {
+        "grace_s": POST_EXIT_GRACE_S,
+        "events": [],
+        "completion_ui": False,
+        "post_exit_frames": 0,
+        "ended_early": False,
+    }
+    if POST_EXIT_GRACE_S <= 0:
+        return summary
+
+    start_ms = time.time() * 1000
+    deadline = time.monotonic() + POST_EXIT_GRACE_S
+
+    def post_exit_frames() -> list[dict]:
+        return [
+            frame
+            for frame in recorder.websocket_frames
+            if frame.get("ts", 0) >= start_ms
+            and "socket.io" in (frame.get("url") or "")
+        ]
+
+    seen: set[tuple[str, str]] = set()
+    while time.monotonic() < deadline:
+        for frame in post_exit_frames():
+            payload = frame.get("payload") or ""
+            for name in ("end-interview", "interview_exit"):
+                if name in payload:
+                    seen.add((name, frame.get("direction") or "?"))
+            if '"isSegmentComplete":true' in payload:
+                seen.add(
+                    ("final-chunk-flush", frame.get("direction") or "?")
+                )
+        summary["completion_ui"] = await detect_interview_complete(page)
+        names = {name for name, _direction in seen}
+        if summary["completion_ui"] and (
+            "end-interview" in names or "interview_exit" in names
+        ):
+            summary["ended_early"] = True
+            break
+        await asyncio.sleep(1.0)
+
+    frames = post_exit_frames()
+    summary["events"] = sorted(f"{n}({d})" for n, d in seen)
+    summary["post_exit_frames"] = len(frames)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "post_exit_frames.jsonl").write_text(
+            "\n".join(json.dumps(frame) for frame in frames)
+        )
+    except Exception:
+        pass
+    stages.stamp(
+        f"Post-exit grace ({POST_EXIT_GRACE_S:.0f}s cap, ended "
+        f"{'early on confirmed completion' if summary['ended_early'] else 'at the bound'}): "
+        f"completion events {summary['events'] or 'NONE'}, "
+        f"completion UI {summary['completion_ui']}, "
+        f"{summary['post_exit_frames']} post-exit socket frame(s) "
+        f"-> {run_dir / 'post_exit_frames.jsonl'}"
+    )
+    return summary
+
 
 async def run_multi_turn(
     page,
@@ -2187,36 +2282,91 @@ async def run_multi_turn(
     stages: StageLog,
     run_dir: Path,
     watcher: BotAudioWatcher,
-    fixtures: list[Path],
+    answers,
     detector_ok: bool,
     turn_reports: list[dict],
     collector: TranscriptCollector,
     audio_records: list[dict],
     interview_status: dict | None = None,
     audio_manifest: list[dict] | None = None,
+    deferred: list[dict] | None = None,
 ) -> dict:
+    """
+    Drive the interview until the AI interviewer CONCLUDES it.
+
+    The evaluator stays in the room for the whole interview:
+    a bot that does not answer is never a reason to leave.
+    Each non-response is recorded as a deferred failure (full
+    diagnostics), followed by a recovery wait for a late reply
+    and a re-prompt (the candidate answer is spoken again). The
+    loop exits ONLY on the bot's conclusion signal, or on the
+    INTERVIEW_MAX_S wall-clock safety cap / optional EMH_MAX_TURNS.
+    """
+
+    # `answers` is the per-turn answer source: the live drive
+    # passes a LiveSimulatorAnswerSource (actual interviewer
+    # question -> CandidateSimulator -> speech). The offline
+    # FakeBot harness passes a list of WAV paths, wrapped here -
+    # that wrapper is never used by the live test.
+    if isinstance(answers, (list, tuple)):
+        answers = ScriptedAnswerSource([Path(p) for p in answers])
+
     # interview_status is mutated IN PLACE as turns complete so
-    # the finally-block status sidecar is correct even when this
-    # function exits via pytest.fail mid-interview. Previously
-    # the sidecar recorded turn_count=0 for a run that froze at
-    # turn 11 - a lying status that broke downstream freshness/
-    # completeness gating.
+    # the finally-block status sidecar is truthful whatever way
+    # this function exits.
     if interview_status is None:
         interview_status = {}
     if audio_manifest is None:
         audio_manifest = []
+    if deferred is None:
+        deferred = []
 
     use_stats = not detector_ok
+    drive_started = time.monotonic()
+    drive_deadline = drive_started + INTERVIEW_MAX_S
+
+    def time_left() -> float:
+        return drive_deadline - time.monotonic()
 
     stages.stamp(
         "Greeting (scripted) validated separately - turn 1 below "
         "is the FIRST REAL INTERACTIVE TURN: the first candidate "
-        "response that exercises the full STT -> AI -> TTS loop."
+        "response that exercises the full STT -> AI -> TTS loop. "
+        "The evaluator stays in the room until the interviewer "
+        f"concludes (wall-clock cap {INTERVIEW_MAX_S}s"
+        + (f", hard turn cap {MAX_TURNS}" if MAX_TURNS else "")
+        + ")."
     )
 
     turn = 0
     interview_complete = False
-    while turn < MAX_TURNS:
+    conclusion_reason: str | None = None
+    reached_cap = False
+    room_state: dict = {}
+    interview_status.setdefault("stalls", 0)
+    interview_status.setdefault("recoveries", 0)
+    interview_status.setdefault("room_disconnected", False)
+
+    while True:
+        # ---- Safety caps (never the normal exit path) ----
+        if time_left() <= 0:
+            reached_cap = True
+            stages.stamp(
+                f"[WARNING] Wall-clock cap INTERVIEW_MAX_S="
+                f"{INTERVIEW_MAX_S}s exhausted after {turn} "
+                "candidate turn(s) without an interview-complete "
+                "signal - leaving the room."
+            )
+            break
+        if MAX_TURNS and turn >= MAX_TURNS:
+            reached_cap = True
+            stages.stamp(
+                f"[WARNING] Hard turn cap EMH_MAX_TURNS={MAX_TURNS} "
+                "reached without an interview-complete signal - "
+                "leaving the room."
+            )
+            break
+
         turn += 1
 
         # Wait for the interviewer to finish its current question.
@@ -2252,333 +2402,413 @@ async def run_multi_turn(
             if concluded:
                 turn -= 1
                 interview_complete = True
+                conclusion_reason = concluded
                 stages.stamp(
                     "Interview-complete signal detected after "
                     f"{turn} candidate answer(s) ({concluded}) - "
-                    "ending the drive-to-completion loop "
-                    "cleanly, no further answers injected."
+                    "the AI interviewer concluded the interview; "
+                    "ending the drive loop cleanly, no further "
+                    "answers injected."
                 )
                 break
         elif turn > FORCED_TURNS:
+            # Debug mode: a forced turn count is NOT a completed
+            # interview - the transcript stays marked incomplete.
             turn -= 1
+            conclusion_reason = (
+                f"forced turn count EMH_INTERVIEW_TURNS={FORCED_TURNS} "
+                "(debug; not a bot conclusion)"
+            )
             break
 
-        answer_wav = fixtures[(turn - 1) % len(fixtures)]
-        stages.stamp(
-            f"[Turn {turn}/max {MAX_TURNS}] Speaking candidate "
-            f"answer ({answer_wav.name})..."
-        )
-
-        pipe = TurnPipeline(turn)
-        mic_before = await mic_state(page)
-        snapshot_before = await rtc_snapshot(page)
-        out_before = outbound_totals(snapshot_before)
-        body_before = await body_text_lines(page)
-        await watcher.rebase()
-        answer_start_wall = time.time() * 1000
-
-        clip_ms = await page.evaluate(
-            "b => window.__emhSpeak(b)",
-            fixture_base64(answer_wav),
-        )
-
-        # Start recording the bot's REPLY to this answer (the
-        # remote track carries only bot audio, so starting now
-        # captures the full upcoming utterance).
-        await start_bot_audio_recording(page)
-
-        # Stage 1: candidate mic - the injected clip must carry
-        # energy on the fake microphone track (harness sanity).
-        mic_after = await mic_state(page)
-        mic_energy = mic_after["speechMs"] - mic_before["speechMs"]
-        pipe.verdict(
-            "candidate_mic", mic_energy > 0,
-            f"{mic_energy} ms of mic energy from a {clip_ms} ms clip",
-        )
-        assert mic_energy > 0, (
-            f"Turn {turn}: candidate audio was injected "
-            f"({clip_ms} ms clip) but produced no energy on the "
-            "fake microphone track - the input side of the test "
-            "harness is broken, this is NOT a bot failure."
-        )
-
-        # Stage 2: outbound RTP - the answer must actually LEAVE
-        # the browser with real (non-silent) source audio.
-        snapshot_after_clip = await rtc_snapshot(page)
-        out_after = outbound_totals(snapshot_after_clip)
-        sent_delta = out_after["bytesSent"] - out_before["bytesSent"]
-        packets_sent_delta = (
-            out_after["packetsSent"] - out_before["packetsSent"]
-        )
-        pipe.verdict(
-            "outbound_rtp", sent_delta > 0,
-            f"bytesSent +{sent_delta}, packetsSent "
-            f"+{packets_sent_delta}, sourceAudioLevel "
-            f"{out_after['sourceAudioLevel']}",
-        )
-
-        # Stage 3: LiveKit received it - the SFU's RTCP receiver
-        # reports for our outbound stream are the only browser-
-        # observable proof of server-side receipt.
-        remote_reports = snapshot_after_clip.get(
-            "remoteInboundAudio", []
-        )
-        if remote_reports:
-            pipe.verdict(
-                "livekit_receive", sent_delta > 0,
-                f"RTCP receiver reports: {remote_reports}",
+        # The answer for THIS turn: read the interviewer's actual
+        # completed question from the live caption stream and let
+        # the simulator answer it. No scripted fallback - an
+        # unreadable question fails the drive with the reason.
+        try:
+            answer_wav, answer_text, live_question, _ = (
+                await answers.next_answer(turn, page)
             )
-        else:
-            pipe.record(
-                "livekit_receive", "UNKNOWN",
-                "no remote-inbound-rtp reports exposed yet",
-            )
+        except LiveQuestionUnavailable as error:
+            reason = f"LIVE QUESTION UNAVAILABLE at turn {turn}: {error}"
+            stages.stamp(f"[Turn {turn}] {reason}")
+            interview_status["conclusion_reason"] = reason
+            raise AssertionError(
+                f"{reason}\n"
+                "The candidate simulator can only answer the ACTUAL "
+                "interviewer question; it never substitutes scripted "
+                "text. Either the interviewer produced no new "
+                "utterance after the previous answer (bot failure) or "
+                "its caption stream was not captured (capture "
+                "failure) - see the deferred failures / stage log."
+            ) from error
 
-        stages.stamp(
-            f"[Turn {turn}] Candidate audio delivered ({clip_ms} ms, "
-            f"mic energy {mic_energy} ms, "
-            f"outbound bytesSent +{sent_delta}, published "
-            f"sourceAudioLevel {out_after['sourceAudioLevel']})."
-        )
-        if sent_delta <= 0:
-            # If the interview concluded while (or just before)
-            # this answer played, the app legitimately tears
-            # down its published track: missing outbound RTP is
-            # expected teardown here, NOT an audio/bot failure.
-            concluded = await interview_concluded(page, recorder)
-            if concluded:
-                interview_complete = True
-                stages.stamp(
-                    f"[Turn {turn}] Interview concluded during "
-                    f"this answer ({concluded}) - outbound "
-                    "publish teardown is expected; ending the "
-                    "loop cleanly and marking the interview "
-                    "complete."
-                )
-                turn -= 1
-                break
-            message = await capture_failure(
-                page, context, recorder, stages, run_dir,
-                label=f"CANDIDATE AUDIO NOT PUBLISHED AT TURN {turn}",
-                reason=(
-                    "The fake microphone carried energy locally but "
-                    "no outbound audio bytes were sent to LiveKit "
-                    f"during the {clip_ms} ms answer - the bot never "
-                    "had a chance to hear it. This is a publish "
-                    "problem (app or harness), NOT a bot-response "
-                    "failure."
-                ),
-                likely_causes=[
-                    "The app stopped/replaced its published mic "
-                    "track (see local mic track states above).",
-                    "The LiveKit publication was closed mid-"
-                    "interview.",
-                ],
-                turn_reports=turn_reports,
-                pipeline=pipe,
-            )
-            pytest.fail(message)
-
-        # Stages 4-9: the bot must reply with audible speech.
-        # Fail fast if the app's own watchdog declares the agent
-        # dead - waiting out the rest of the timeout after that
-        # only wastes time.
-        deadline = time.monotonic() + BOT_RESPONSE_TIMEOUT_S
+        # ------------------------------------------------------
+        # One candidate turn = as many ATTEMPTS as it takes:
+        # inject the answer, wait for the bot; on a stall
+        # record the failure, wait for a late reply, re-prompt.
+        # ------------------------------------------------------
+        attempt = 0
         responded = False
         via = None
-        result = None
-        watchdog_hits: list[dict] = []
-        while time.monotonic() < deadline:
-            result = await watcher.poll()
-            if result["analyser_heard"]:
-                responded, via = True, "analyser"
-                break
-            if use_stats and result["stats_heard"]:
-                responded, via = True, "stats"
-                break
-            warnings = recorder.fatal_app_warnings_since(
-                answer_start_wall
+        turn_done = False
+        while not turn_done:
+            attempt += 1
+            if time_left() <= 0:
+                break  # outer loop records the wall-clock cap
+
+            retry_note = f" (re-prompt #{attempt - 1})" if attempt > 1 else ""
+            stages.stamp(
+                f"[Turn {turn}] Speaking candidate answer "
+                f"({answer_wav.name}){retry_note}..."
             )
-            agent_gone = [
-                w for w in warnings
-                if "no agent response" in w["text"].lower()
-            ]
-            stream_gone = [
-                w for w in warnings
-                if "no active audio stream" in w["text"].lower()
-            ]
-            if agent_gone or len(stream_gone) >= 3:
-                watchdog_hits = warnings
-                stages.stamp(
-                    f"[Turn {turn}] FAIL-FAST: app watchdog "
-                    f"warning \"{warnings[-1]['text'][:100]}\" - "
-                    "not waiting out the remaining response "
-                    "timeout."
+
+            pipe = TurnPipeline(turn)
+            mic_before = await mic_state(page)
+            snapshot_before = await rtc_snapshot(page)
+            out_before = outbound_totals(snapshot_before)
+            body_before = await body_text_lines(page)
+            await watcher.rebase()
+            answer_start_wall = time.time() * 1000
+
+            clip_ms = await page.evaluate(
+                "b => window.__emhSpeak(b)",
+                fixture_base64(answer_wav),
+            )
+
+            # Start recording the bot's REPLY to this answer (the
+            # remote track carries only bot audio, so starting now
+            # captures the full upcoming utterance).
+            await start_bot_audio_recording(page)
+
+            # Stage 1: candidate mic - the injected clip must carry
+            # energy on the fake microphone track (harness sanity).
+            mic_after = await mic_state(page)
+            mic_energy = mic_after["speechMs"] - mic_before["speechMs"]
+            pipe.verdict(
+                "candidate_mic", mic_energy > 0,
+                f"{mic_energy} ms of mic energy from a {clip_ms} ms clip",
+            )
+            assert mic_energy > 0, (
+                f"Turn {turn}: candidate audio was injected "
+                f"({clip_ms} ms clip) but produced no energy on the "
+                "fake microphone track - the input side of the test "
+                "harness is broken, this is NOT a bot failure."
+            )
+
+            # Stage 2: outbound RTP - the answer must actually LEAVE
+            # the browser with real (non-silent) source audio.
+            snapshot_after_clip = await rtc_snapshot(page)
+            out_after = outbound_totals(snapshot_after_clip)
+            sent_delta = out_after["bytesSent"] - out_before["bytesSent"]
+            packets_sent_delta = (
+                out_after["packetsSent"] - out_before["packetsSent"]
+            )
+            pipe.verdict(
+                "outbound_rtp", sent_delta > 0,
+                f"bytesSent +{sent_delta}, packetsSent "
+                f"+{packets_sent_delta}, sourceAudioLevel "
+                f"{out_after['sourceAudioLevel']}",
+            )
+
+            # Stage 3: LiveKit received it - the SFU's RTCP receiver
+            # reports for our outbound stream are the only browser-
+            # observable proof of server-side receipt.
+            remote_reports = snapshot_after_clip.get(
+                "remoteInboundAudio", []
+            )
+            if remote_reports:
+                pipe.verdict(
+                    "livekit_receive", sent_delta > 0,
+                    f"RTCP receiver reports: {remote_reports}",
                 )
-                break
-            await asyncio.sleep(0.5)
-        response_wall = time.time() * 1000
-
-        # STT / AI evidence from the rendered conversation text.
-        answer_text = CANDIDATE_ANSWERS[
-            (turn - 1) % len(CANDIDATE_ANSWERS)
-        ]
-        new_lines = await body_new_lines(page, body_before)
-        evidence = transcript_evidence(new_lines, answer_text)
-
-        # Real transcript capture: the candidate turn is what the
-        # app's STT rendered for the injected audio (falling back
-        # to the exact text that was spoken into the mic), the
-        # assistant turn is the newly rendered interviewer text.
-        app_stt_text = " ".join(evidence["stt_lines"]).strip()
-        collector.record_turn(
-            "user",
-            app_stt_text or answer_text,
-            source="app-stt" if app_stt_text else "injected-audio",
-            turn=turn,
-        )
-        collector.record_assistant_lines(
-            evidence["ai_lines"], source="dom-diff", turn=turn
-        )
-        audio_records.append(
-            {
-                "turn": turn,
-                "interviewer_prompt": None,
-                "reference_transcript": answer_text,
-                "stt_transcript": app_stt_text or None,
-                "reference_segments": None,
-                "detected_segments": None,
-                "audio_path": str(answer_wav),
-            }
-        )
-        # The candidate clip actually injected this turn also
-        # feeds the stt-local transcript (genuine STT output of
-        # the audio the bot heard).
-        audio_manifest.append(
-            {
-                "role": "user",
-                "turn": turn,
-                "audio_path": str(answer_wav),
-            }
-        )
-        if evidence["stt_seen"]:
-            pipe.verdict(
-                "stt", True,
-                f"answer text rendered on screen "
-                f"({evidence['stt_matched_words']}/"
-                f"{evidence['stt_vocabulary']} words)",
-            )
-        else:
-            pipe.record(
-                "stt", "UNKNOWN",
-                "answer transcript not visible in page text "
-                f"({evidence['new_line_count']} new lines) - STT "
-                "runs inside the agent worker",
-            )
-        if evidence["ai_seen"]:
-            pipe.verdict(
-                "ai", True,
-                f"new agent text: \"{evidence['ai_sample']}\"",
-            )
-        else:
-            pipe.record(
-                "ai", "UNKNOWN",
-                "no new agent text visible in page body",
-            )
-        # TTS itself runs inside the agent worker; audio arriving
-        # on the wire (later stages) is the only proof.
-        pipe.record(
-            "tts", "UNKNOWN",
-            "not directly observable from the browser",
-        )
-
-        # Agent publish state during the response window.
-        final_snapshot = result["snapshot"] if result else {}
-        live_tracks = [
-            track for track in
-            final_snapshot.get("remoteAudioTracks", [])
-            if track["readyState"] == "live"
-        ]
-        publishing = [
-            track for track in live_tracks if track["everUnmuted"]
-        ]
-        pipe.verdict(
-            "agent_publish", len(publishing) > 0,
-            f"{len(live_tracks)} live remote audio track(s), "
-            f"{len(publishing)} ever unmuted; mute states: "
-            + str([
-                (track["id"][:8], track["muted"])
-                for track in final_snapshot.get(
-                    "remoteAudioTracks", []
+            else:
+                pipe.record(
+                    "livekit_receive", "UNKNOWN",
+                    "no remote-inbound-rtp reports exposed yet",
                 )
-            ]),
-        )
 
-        # Browser inbound RTP: packets AND non-silent content.
-        if result:
-            packets_ok = (
-                result["bytes_delta"] >= STATS_MIN_BYTES
-                and result["packets_delta"] >= STATS_MIN_PACKETS
+            stages.stamp(
+                f"[Turn {turn}] Candidate audio delivered ({clip_ms} ms, "
+                f"mic energy {mic_energy} ms, "
+                f"outbound bytesSent +{sent_delta}, published "
+                f"sourceAudioLevel {out_after['sourceAudioLevel']})."
             )
-            non_silent = result["max_level"] >= STATS_AUDIO_LEVEL
-            pipe.verdict(
-                "inbound_rtp", packets_ok and non_silent,
-                f"bytesReceived +{result['bytes_delta']}, "
-                f"packetsReceived +{result['packets_delta']}, "
-                f"max audioLevel {result['max_level']}"
-                + (
-                    " (packets flowed but content is SILENCE)"
-                    if packets_ok and not non_silent else ""
-                ),
-            )
-        else:
-            pipe.verdict("inbound_rtp", False, "no stats polled")
-
-        # Browser playback: decoded agent audio reaching WebAudio.
-        # The app attaches no dedicated <audio> element (its only
-        # media element is a muted <video> with no tracks), so
-        # element-level capture is NOT authoritative here -
-        # decoded remote-track energy is the playback signal, and
-        # element energy is recorded as extra detail only.
-        if result and (result["track_heard"] or result["element_heard"]):
-            pipe.verdict(
-                "audio_element", True,
-                f"decoded-track energy {result['track_ms']} ms, "
-                f"element energy {result['element_ms']} ms",
-            )
-        else:
-            pipe.verdict(
-                "audio_element", False,
-                "no decoded agent audio reached the browser's "
-                "WebAudio graph",
-            )
-
-        turn_reports.append(
-            {
-                "turn": turn,
-                "answer_fixture": answer_wav.name,
-                "answer_clip_ms": clip_ms,
-                "candidate_mic_energy_ms": (
-                    mic_after["speechMs"] - mic_before["speechMs"]
-                ),
-                "bot_responded": responded,
-                "detected_via": via,
-                "response_latency_s": (
-                    round(
-                        (response_wall - answer_start_wall) / 1000
-                        - clip_ms / 1000,
-                        1,
+            if sent_delta <= 0:
+                # If the interview concluded while (or just before)
+                # this answer played, the app legitimately tears
+                # down its published track: missing outbound RTP is
+                # expected teardown here, NOT an audio/bot failure.
+                concluded = await interview_concluded(page, recorder)
+                if concluded:
+                    interview_complete = True
+                    conclusion_reason = concluded
+                    stages.stamp(
+                        f"[Turn {turn}] Interview concluded during "
+                        f"this answer ({concluded}) - outbound "
+                        "publish teardown is expected; ending the "
+                        "loop cleanly and marking the interview "
+                        "complete."
                     )
-                    if responded else None
-                ),
-                "bytes_delta": result["bytes_delta"] if result else 0,
-                "packets_delta": result["packets_delta"] if result else 0,
-                "max_audio_level": result["max_level"] if result else 0,
-                "pipeline": pipe.as_dict(),
-            }
-        )
+                    turn -= 1
+                    turn_done = True
+                    break
+                message = await capture_failure(
+                    page, context, recorder, stages, run_dir,
+                    label=f"CANDIDATE AUDIO NOT PUBLISHED AT TURN {turn}",
+                    reason=(
+                        "The fake microphone carried energy locally but "
+                        "no outbound audio bytes were sent to LiveKit "
+                        f"during the {clip_ms} ms answer - the bot never "
+                        "had a chance to hear it. This is a publish "
+                        "problem (app or harness), NOT a bot-response "
+                        "failure."
+                    ),
+                    likely_causes=[
+                        "The app stopped/replaced its published mic "
+                        "track (see local mic track states above).",
+                        "The LiveKit publication was closed mid-"
+                        "interview.",
+                    ],
+                    turn_reports=turn_reports,
+                    pipeline=pipe,
+                    keep_trace=True,
+                    screenshot_name=(
+                        f"bot_responsiveness_turn{turn:02d}_"
+                        f"attempt{attempt}_publish.png"
+                    ),
+                )
+                defer_failure(
+                    deferred, stages, turn=turn, attempt=attempt,
+                    label=f"CANDIDATE AUDIO NOT PUBLISHED AT TURN {turn}",
+                    message=message,
+                )
+                interview_status["stalls"] += 1
+                # Give the app a moment to re-publish, then
+                # re-prompt (stay in the room).
+                heard, concluded = await wait_for_late_reply(
+                    page, watcher, recorder, use_stats,
+                    min(BOT_RECOVERY_TIMEOUT_S, max(0, time_left())),
+                    room_state=room_state,
+                )
+                if concluded:
+                    interview_complete = True
+                    conclusion_reason = concluded
+                    turn -= 1
+                    turn_done = True
+                    break
+                if room_state.get("disconnected"):
+                    break
+                continue
 
-        if not responded:
+            # Stages 4-9: the bot must reply with audible speech.
+            # The app's own watchdog declaring the agent silent
+            # ends THIS WAIT early (no point waiting out the rest
+            # of the timeout) - it never ends the interview.
+            deadline = time.monotonic() + min(
+                BOT_RESPONSE_TIMEOUT_S, max(1, time_left())
+            )
+            responded = False
+            via = None
+            result = None
+            watchdog_hits: list[dict] = []
+            while time.monotonic() < deadline:
+                result = await watcher.poll()
+                if result["analyser_heard"]:
+                    responded, via = True, "analyser"
+                    break
+                if use_stats and result["stats_heard"]:
+                    responded, via = True, "stats"
+                    break
+                warnings = recorder.fatal_app_warnings_since(
+                    answer_start_wall
+                )
+                agent_gone = [
+                    w for w in warnings
+                    if "no agent response" in w["text"].lower()
+                ]
+                stream_gone = [
+                    w for w in warnings
+                    if "no active audio stream" in w["text"].lower()
+                ]
+                if agent_gone or len(stream_gone) >= 3:
+                    watchdog_hits = warnings
+                    stages.stamp(
+                        f"[Turn {turn}] App watchdog warning "
+                        f"\"{warnings[-1]['text'][:100]}\" - ending "
+                        "this response wait early (the interview "
+                        "continues: recovery wait + re-prompt)."
+                    )
+                    break
+                await asyncio.sleep(0.5)
+            response_wall = time.time() * 1000
+
+            # STT / AI evidence from the rendered conversation text.
+            new_lines = await body_new_lines(page, body_before)
+            evidence = transcript_evidence(new_lines, answer_text)
+
+            # Real transcript capture: the candidate turn is what the
+            # app's STT rendered for the injected audio (falling back
+            # to the exact text that was spoken into the mic), the
+            # assistant turn is the newly rendered interviewer text.
+            # Re-prompts are recorded too - the bot heard them.
+            app_stt_text = " ".join(evidence["stt_lines"]).strip()
+            collector.record_turn(
+                "user",
+                app_stt_text or answer_text,
+                source="app-stt" if app_stt_text else "injected-audio",
+                turn=turn,
+            )
+            collector.record_assistant_lines(
+                evidence["ai_lines"], source="dom-diff", turn=turn
+            )
+            audio_records.append(
+                {
+                    "turn": turn,
+                    "attempt": attempt,
+                    "interviewer_prompt": None,
+                    "reference_transcript": answer_text,
+                    "stt_transcript": app_stt_text or None,
+                    "reference_segments": None,
+                    "detected_segments": None,
+                    "audio_path": str(answer_wav),
+                }
+            )
+            # The candidate clip actually injected this attempt also
+            # feeds the stt-local transcript (genuine STT output of
+            # the audio the bot heard).
+            audio_manifest.append(
+                {
+                    "role": "user",
+                    "turn": turn,
+                    "attempt": attempt,
+                    "audio_path": str(answer_wav),
+                }
+            )
+            if evidence["stt_seen"]:
+                pipe.verdict(
+                    "stt", True,
+                    f"answer text rendered on screen "
+                    f"({evidence['stt_matched_words']}/"
+                    f"{evidence['stt_vocabulary']} words)",
+                )
+            else:
+                pipe.record(
+                    "stt", "UNKNOWN",
+                    "answer transcript not visible in page text "
+                    f"({evidence['new_line_count']} new lines) - STT "
+                    "runs inside the agent worker",
+                )
+            if evidence["ai_seen"]:
+                pipe.verdict(
+                    "ai", True,
+                    f"new agent text: \"{evidence['ai_sample']}\"",
+                )
+            else:
+                pipe.record(
+                    "ai", "UNKNOWN",
+                    "no new agent text visible in page body",
+                )
+            # TTS itself runs inside the agent worker; audio arriving
+            # on the wire (later stages) is the only proof.
+            pipe.record(
+                "tts", "UNKNOWN",
+                "not directly observable from the browser",
+            )
+
+            # Agent publish state during the response window.
+            final_snapshot = result["snapshot"] if result else {}
+            live_tracks = [
+                track for track in
+                final_snapshot.get("remoteAudioTracks", [])
+                if track["readyState"] == "live"
+            ]
+            publishing = [
+                track for track in live_tracks if track["everUnmuted"]
+            ]
+            pipe.verdict(
+                "agent_publish", len(publishing) > 0,
+                f"{len(live_tracks)} live remote audio track(s), "
+                f"{len(publishing)} ever unmuted; mute states: "
+                + str([
+                    (track["id"][:8], track["muted"])
+                    for track in final_snapshot.get(
+                        "remoteAudioTracks", []
+                    )
+                ]),
+            )
+
+            # Browser inbound RTP: packets AND non-silent content.
+            if result:
+                packets_ok = (
+                    result["bytes_delta"] >= STATS_MIN_BYTES
+                    and result["packets_delta"] >= STATS_MIN_PACKETS
+                )
+                non_silent = result["max_level"] >= STATS_AUDIO_LEVEL
+                pipe.verdict(
+                    "inbound_rtp", packets_ok and non_silent,
+                    f"bytesReceived +{result['bytes_delta']}, "
+                    f"packetsReceived +{result['packets_delta']}, "
+                    f"max audioLevel {result['max_level']}"
+                    + (
+                        " (packets flowed but content is SILENCE)"
+                        if packets_ok and not non_silent else ""
+                    ),
+                )
+            else:
+                pipe.verdict("inbound_rtp", False, "no stats polled")
+
+            # Browser playback: decoded agent audio reaching WebAudio.
+            # The app attaches no dedicated <audio> element (its only
+            # media element is a muted <video> with no tracks), so
+            # element-level capture is NOT authoritative here -
+            # decoded remote-track energy is the playback signal, and
+            # element energy is recorded as extra detail only.
+            if result and (result["track_heard"] or result["element_heard"]):
+                pipe.verdict(
+                    "audio_element", True,
+                    f"decoded-track energy {result['track_ms']} ms, "
+                    f"element energy {result['element_ms']} ms",
+                )
+            else:
+                pipe.verdict(
+                    "audio_element", False,
+                    "no decoded agent audio reached the browser's "
+                    "WebAudio graph",
+                )
+
+            turn_reports.append(
+                {
+                    "turn": turn,
+                    "attempt": attempt,
+                    "answer_fixture": answer_wav.name,
+                    "answer_clip_ms": clip_ms,
+                    "candidate_mic_energy_ms": (
+                        mic_after["speechMs"] - mic_before["speechMs"]
+                    ),
+                    "bot_responded": responded,
+                    "detected_via": via,
+                    "response_latency_s": (
+                        round(
+                            (response_wall - answer_start_wall) / 1000
+                            - clip_ms / 1000,
+                            1,
+                        )
+                        if responded else None
+                    ),
+                    "bytes_delta": result["bytes_delta"] if result else 0,
+                    "packets_delta": result["packets_delta"] if result else 0,
+                    "max_audio_level": result["max_level"] if result else 0,
+                    "pipeline": pipe.as_dict(),
+                }
+            )
+
+            if responded:
+                turn_done = True
+                break
+
+            # ---- Bot did not reply within the response window ----
+
             # A bot that just DELIVERED its closing statement
             # does not reply again: if the interview concluded
             # during this turn, this is natural completion, not
@@ -2586,12 +2816,14 @@ async def run_multi_turn(
             concluded = await interview_concluded(page, recorder)
             if concluded:
                 interview_complete = True
+                conclusion_reason = concluded
                 stages.stamp(
                     f"[Turn {turn}] No further bot reply and the "
                     f"interview has concluded ({concluded}) - "
                     "treating this as natural completion, not a "
                     "response failure."
                 )
+                turn_done = True
                 break
 
             # Agent-side diagnostics streamed over the LiveKit
@@ -2646,7 +2878,7 @@ async def run_multi_turn(
                     "the mid-interview freeze, not a join/dispatch "
                     "problem."
                     + (
-                        " FAILED FAST on app watchdog warning(s): "
+                        " App watchdog warning(s): "
                         + "; ".join(
                             f"[{datetime.fromtimestamp(w['ts'] / 1000):%H:%M:%S}] "
                             f"{w['text'][:120]}"
@@ -2661,6 +2893,7 @@ async def run_multi_turn(
                         + " | ".join(dc_agent_errors)
                         if dc_agent_errors else ""
                     )
+                    + f" (attempt {attempt} of this turn)"
                 )
             )
             message = await capture_failure(
@@ -2685,41 +2918,168 @@ async def run_multi_turn(
                 ),
                 turn_reports=turn_reports,
                 pipeline=pipe,
+                keep_trace=True,
+                screenshot_name=(
+                    f"bot_responsiveness_turn{turn:02d}_"
+                    f"attempt{attempt}_stall.png"
+                ),
             )
-            pytest.fail(message)
+            defer_failure(
+                deferred, stages, turn=turn, attempt=attempt,
+                label=label, message=message,
+            )
+            interview_status["stalls"] += 1
+
+            if stats_received:
+                # Bot audio DID arrive (detector problem only):
+                # the interview is progressing - move on with
+                # stats-based detection rather than re-prompting
+                # into a bot that already answered.
+                use_stats = True
+                responded, via = True, "stats"
+                turn_reports[-1]["bot_responded"] = True
+                turn_reports[-1]["detected_via"] = "stats"
+                turn_done = True
+                break
+
+            # ---- Recovery: stay in the room, wait for a late
+            # reply, then re-prompt with the same answer. ----
+            wait_s = min(BOT_RECOVERY_TIMEOUT_S, max(0, time_left()))
+            stages.stamp(
+                f"[Turn {turn}] RECOVERY: staying in the room for "
+                f"up to {wait_s:.0f}s for a late bot reply or a "
+                "conclusion signal before re-prompting."
+            )
+            heard, concluded = await wait_for_late_reply(
+                page, watcher, recorder, use_stats, wait_s,
+                room_state=room_state,
+            )
+            if room_state.get("disconnected"):
+                stages.stamp(
+                    f"[Turn {turn}] {ROOM_DISCONNECTED}: LiveKit peer "
+                    "connections closed and no remote track for "
+                    f">= {ROOM_DISCONNECT_GRACE_S}s during the "
+                    "recovery wait - the room is gone, nothing to "
+                    "stay in. Leaving with an ENVIRONMENT "
+                    "classification (transcript incomplete)."
+                )
+                break
+            if concluded:
+                interview_complete = True
+                conclusion_reason = concluded
+                stages.stamp(
+                    f"[Turn {turn}] Interview concluded during the "
+                    f"recovery wait ({concluded})."
+                )
+                turn_done = True
+                break
+            if heard:
+                # The bot recovered on its own (late reply).
+                deferred[-1]["recovered"] = True
+                deferred[-1]["recovery"] = "late reply"
+                interview_status["recoveries"] += 1
+                responded, via = True, "late-reply"
+                turn_reports[-1]["bot_responded"] = True
+                turn_reports[-1]["detected_via"] = "late-reply"
+                turn_reports[-1]["response_latency_s"] = round(
+                    (time.time() * 1000 - answer_start_wall) / 1000
+                    - clip_ms / 1000, 1,
+                )
+                stages.stamp(
+                    f"[Turn {turn}] RECOVERED: late bot reply heard "
+                    "during the recovery wait - continuing the "
+                    "interview."
+                )
+                turn_done = True
+                break
+            # Still silent: re-prompt (next attempt). The loop
+            # is bounded only by the wall-clock cap.
+            stages.stamp(
+                f"[Turn {turn}] Still no bot reply after the "
+                "recovery wait - re-speaking the candidate answer."
+            )
+            # Wait for the bot to be silent again (it may have
+            # started talking right at the deadline).
+            await wait_for_bot_silence(page, watcher)
+
+        if interview_complete:
+            break
+
+        if room_state.get("disconnected"):
+            interview_status["room_disconnected"] = True
+            break
+
+        if not responded:
+            # Only reachable when the wall-clock cap expired
+            # mid-turn; the outer loop records the cap.
+            continue
 
         pipe.finalize()
         report = turn_reports[-1]
+        if attempt > 1:
+            deferred_for_turn = [
+                d for d in deferred if d["turn"] == turn
+            ]
+            for entry in deferred_for_turn:
+                if not entry["recovered"]:
+                    entry["recovered"] = True
+                    entry["recovery"] = f"answered after re-prompt #{attempt - 1}"
+            interview_status["recoveries"] += 1
         stages.stamp(
             f"[Turn {turn}] Bot replied in "
             f"~{report['response_latency_s']}s (via {via}, bytes "
             f"+{report['bytes_delta']}, packets "
-            f"+{report['packets_delta']})."
+            f"+{report['packets_delta']}"
+            + (f", after {attempt - 1} re-prompt(s)" if attempt > 1 else "")
+            + ")."
         )
         for line in pipe.lines():
             print(f"  {line}")
 
-        # Turn finished end-to-end: record it immediately so a
-        # later fail-fast still leaves a truthful sidecar.
+        # Turn finished end-to-end: record it immediately so the
+        # sidecar is truthful whatever happens next.
         interview_status["turns_completed"] = turn
 
-    reached_cap = not interview_complete and turn >= MAX_TURNS
-    if reached_cap:
+    if interview_status.get("room_disconnected"):
         stages.stamp(
-            f"[WARNING] Reached MAX_TURNS={MAX_TURNS} without an "
-            "interview-complete signal - the transcript will be "
-            "marked INCOMPLETE (over-long interview or looping "
-            "agent). Whole-interview evaluation will reject it."
+            f"[WARNING] {ROOM_DISCONNECTED} after "
+            f"{interview_status.get('turns_completed', 0)} completed "
+            "candidate turn(s) - the transcript is marked "
+            "INCOMPLETE. This is a room/environment condition, "
+            "not a bot-response failure."
+        )
+    elif reached_cap:
+        stages.stamp(
+            f"[WARNING] Safety cap hit after {turn} candidate "
+            "turn(s) without an interview-complete signal - the "
+            "transcript will be marked INCOMPLETE (agent dead, "
+            "over-long or looping interview). Whole-interview "
+            "evaluation will reject it."
         )
     else:
         stages.stamp(
             f"Interview drive finished: {turn} candidate turn(s), "
-            f"complete={interview_complete}."
+            f"complete={interview_complete} "
+            f"({conclusion_reason}), stalls="
+            f"{interview_status['stalls']}, recoveries="
+            f"{interview_status['recoveries']}, elapsed "
+            f"{time.monotonic() - drive_started:.0f}s."
+        )
+
+    # The interviewer concluded: give the app a bounded window to
+    # finish its completion flow before the caller tears the page
+    # down. Never runs on cap/disconnect exits (nothing to
+    # complete), never hangs (hard POST_EXIT_GRACE_S bound).
+    if interview_complete:
+        interview_status["post_exit"] = await post_exit_grace(
+            page, recorder, stages, run_dir
         )
 
     interview_status["complete"] = interview_complete
-    interview_status["turns_completed"] = turn
+    if interview_complete or FORCED_TURNS is not None:
+        interview_status["turns_completed"] = turn
     interview_status["reached_cap"] = reached_cap
+    interview_status["conclusion_reason"] = conclusion_reason
     return interview_status
 
 
@@ -2752,11 +3112,13 @@ async def test_bot_greets_first_then_stays_responsive():
             "previous capture run."
         )
 
-    # How many distinct candidate answers to synthesize (they
-    # cycle for longer interviews). Driven to completion up to
-    # MAX_TURNS, so pre-generate up to the answer-set size.
-    fixture_count = FORCED_TURNS or min(MAX_TURNS, len(CANDIDATE_ANSWERS))
-    fixtures = ensure_answer_fixtures(fixture_count)
+    if TEST_MODE not in ("competency", "robustness"):
+        pytest.fail(f"EMH_TEST_MODE={TEST_MODE!r} must be competency|robustness")
+    if TEST_MODE == "competency" and SIMULATOR_PERSONA not in PERSONAS:
+        pytest.fail(
+            f"EMH_SIMULATOR_PERSONA={SIMULATOR_PERSONA!r} must be one of "
+            f"{sorted(PERSONAS)}"
+        )
 
     run_dir = (
         DEBUG_ROOT
@@ -2778,7 +3140,14 @@ async def test_bot_greets_first_then_stays_responsive():
         "complete": False,
         "turns_completed": 0,
         "reached_cap": False,
+        "stalls": 0,
+        "recoveries": 0,
+        "conclusion_reason": None,
     }
+    # Classified failures recorded DURING the interview (greeting
+    # / per-turn stalls). They never end the interview; they are
+    # reported after the AI interviewer concludes it.
+    deferred: list[dict] = []
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -2811,7 +3180,8 @@ async def test_bot_greets_first_then_stays_responsive():
             print("=" * 70)
             print(
                 "BOT RESPONSIVENESS TEST (turn 0 greeting + "
-                f"drive-to-completion, cap {MAX_TURNS})"
+                "drive until the AI interviewer concludes; "
+                f"wall-clock cap {INTERVIEW_MAX_S}s)"
             )
             print("=" * 70)
 
@@ -2826,58 +3196,120 @@ async def test_bot_greets_first_then_stays_responsive():
 
             watcher = BotAudioWatcher(page)
 
-            # Phase 1: the bot speaks first. pytest.fail inside
-            # carries one of the classified turn-0 labels.
-            detector_ok = await validate_greeting(
-                page, context, recorder, stages, run_dir, watcher,
-                collector,
+            # Candidate simulator for THIS interview: role/skills/
+            # seniority from the job-candidate-details frame the
+            # recorder just captured; persona or adversarial mode
+            # from the environment. One simulator, one LLM.
+            role = role_context_from_frame_rows(recorder.websocket_frames)
+            simulator = CandidateSimulator(
+                mode=TEST_MODE,
+                role=role,
+                persona=(
+                    PERSONAS[SIMULATOR_PERSONA]
+                    if TEST_MODE == "competency" else None
+                ),
+            )
+            answers = LiveSimulatorAnswerSource(
+                simulator,
+                save_path=SIMULATOR_TURNS_PATH,
+                log=stages.stamp,
+            )
+            stages.stamp(
+                f"Candidate simulator: mode={TEST_MODE}, "
+                f"model={simulator.model}, "
+                + (
+                    f"persona={simulator.persona.id} "
+                    if simulator.persona else "adversarial specs "
+                )
+                + f"role={role.role if role else 'UNKNOWN (no job-candidate-details frame)'}"
             )
 
-            # Phase 2: drive the FULL interview to completion.
-            # Failures here are labelled BOT STOPPED RESPONDING AT
-            # TURN N, never confused with a greeting failure.
-            # interview_status (initialised above) is mutated IN
-            # PLACE per completed turn, so the finally-block
-            # sidecar stays truthful even on a mid-interview
-            # fail-fast.
+            # Phase 1: the bot speaks first. A missing greeting
+            # is recorded as a DEFERRED classified turn-0
+            # failure - the evaluator stays in the room and lets
+            # the interview loop prompt the bot.
+            detector_ok = await validate_greeting(
+                page, context, recorder, stages, run_dir, watcher,
+                collector, deferred=deferred,
+            )
+
+            # Phase 2: drive the FULL interview until the AI
+            # interviewer concludes it. Stalls are recorded as
+            # deferred failures (BOT STOPPED RESPONDING AT TURN N)
+            # and recovered from in-room; they never end the
+            # interview. interview_status is mutated IN PLACE.
             await run_multi_turn(
                 page, context, recorder, stages, run_dir, watcher,
-                fixtures, detector_ok, turn_reports,
+                answers, detector_ok, turn_reports,
                 collector, audio_records,
                 interview_status=interview_status,
                 audio_manifest=audio_manifest,
+                deferred=deferred,
             )
 
-            # A whole interview that never reached completion is a
-            # truncated interview - fail rather than pass a partial
-            # transcript as success.
+            # A whole interview that never reached the bot's
+            # conclusion signal (wall-clock / hard cap hit) is a
+            # truncated interview - fail rather than pass a
+            # partial transcript as success.
             if not interview_status["complete"]:
+                disconnected = interview_status.get("room_disconnected")
                 message = await capture_failure(
                     page, context, recorder, stages, run_dir,
-                    label="INTERVIEW DID NOT COMPLETE",
+                    label=(
+                        ROOM_DISCONNECTED if disconnected
+                        else "INTERVIEW DID NOT COMPLETE"
+                    ),
                     reason=(
                         "The interview ran "
                         f"{interview_status['turns_completed']} "
                         "candidate turn(s) but never reached an "
                         "interview-complete signal "
-                        f"(reached_cap={interview_status['reached_cap']}). "
-                        "The captured transcript is truncated and "
+                        + (
+                            "- the server tore the room down "
+                            "(LiveKit peer connections closed / "
+                            "socket.io transport close) and never "
+                            f"reconnected within "
+                            f"{ROOM_DISCONNECT_GRACE_S}s. ROOM/"
+                            "ENVIRONMENT condition, not a bot-"
+                            "response failure. "
+                            if disconnected else
+                            f"(reached_cap={interview_status['reached_cap']}). "
+                        )
+                        + "The captured transcript is truncated and "
                         "must not be used for whole-interview "
                         "evaluation."
                     ),
                     likely_causes=[
-                        "The agent stalled mid-interview (server-"
-                        "side STT/AI/TTS) and never produced its "
-                        "closing statement.",
-                        "The interview genuinely exceeds MAX_TURNS "
-                        f"({MAX_TURNS}) - raise EMH_MAX_TURNS if the "
-                        "real interview is longer.",
+                        "The agent stalled/died mid-interview "
+                        "(server-side STT/AI/TTS) and never "
+                        "produced its closing statement despite "
+                        f"{interview_status['stalls']} recorded "
+                        "stall(s) with in-room recovery attempts.",
+                        "The interview genuinely exceeds the wall-"
+                        f"clock cap ({INTERVIEW_MAX_S}s) - raise "
+                        "EMH_INTERVIEW_MAX_S if the real interview "
+                        "is longer.",
                     ],
                     turn_reports=turn_reports,
                 )
+                if deferred:
+                    message += (
+                        f"\n\n{len(deferred)} deferred failure(s) "
+                        "were recorded during the interview:\n"
+                        + "\n".join(
+                            f"  - turn {d['turn']} attempt "
+                            f"{d['attempt']}: {d['label']}"
+                            + (
+                                f" (recovered: {d.get('recovery')})"
+                                if d["recovered"] else ""
+                            )
+                            for d in deferred
+                        )
+                    )
                 pytest.fail(message)
 
-            # Success: keep the per-turn report, drop the trace.
+            # The AI interviewer concluded the interview: keep the
+            # per-turn report and the full trace.
             REPORT_DIR.mkdir(parents=True, exist_ok=True)
             (REPORT_DIR / "bot_responsiveness_report.json").write_text(
                 json.dumps(
@@ -2885,24 +3317,66 @@ async def test_bot_greets_first_then_stays_responsive():
                         "room": recorder.room_name,
                         "greeting_detector_ok": detector_ok,
                         "interview_complete": interview_status["complete"],
+                        "conclusion_reason": (
+                            interview_status["conclusion_reason"]
+                        ),
                         "turns_completed": (
                             interview_status["turns_completed"]
                         ),
+                        "stalls": interview_status["stalls"],
+                        "recoveries": interview_status["recoveries"],
+                        "deferred_failures": [
+                            {k: v for k, v in d.items() if k != "message"}
+                            for d in deferred
+                        ],
                         "turns": turn_reports,
                     },
                     indent=2,
                 )
             )
-            await context.tracing.stop()
+            try:
+                await context.tracing.stop(
+                    path=str(run_dir / "trace.zip")
+                )
+            except Exception:
+                pass
 
             print()
             print("=" * 70)
+            if deferred:
+                unrecovered = [d for d in deferred if not d["recovered"]]
+                print(
+                    "INTERVIEW COMPLETED (AI interviewer concluded it "
+                    f"after {interview_status['turns_completed']} "
+                    f"turns) but the bot stalled {len(deferred)} "
+                    f"time(s) ({len(unrecovered)} never recovered) - "
+                    "reporting the deferred failures now."
+                )
+                print("=" * 70)
+                summary = "\n".join(
+                    f"  - turn {d['turn']} attempt {d['attempt']}: "
+                    f"{d['label']}"
+                    + (
+                        f" (recovered: {d.get('recovery')})"
+                        if d["recovered"] else " (NOT recovered)"
+                    )
+                    for d in deferred
+                )
+                pytest.fail(
+                    "BOT RESPONSIVENESS DEGRADED - interview "
+                    "completed (transcript is complete and "
+                    f"scorable) but {len(deferred)} stall(s) were "
+                    "recorded during the interview:\n"
+                    f"{summary}\n\nFirst stall diagnostics:\n"
+                    f"{deferred[0]['message']}"
+                )
             print(
                 "BOT RESPONSIVENESS TEST PASSED - greeting verified "
                 "(bot spoke first) and the bot stayed responsive "
-                "through the FULL interview "
+                "through the FULL interview until the AI "
+                "interviewer concluded it "
                 f"({interview_status['turns_completed']} turns, "
-                "completed)."
+                f"{interview_status['conclusion_reason']})."
             )
             print("=" * 70)
 
@@ -3045,6 +3519,16 @@ async def test_bot_greets_first_then_stays_responsive():
                     f"(harness issue): {error}"
                 )
 
+            # Deferred (non-terminal) failure log for the report
+            # layer - full diagnostics per stall.
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "deferred_failures.json").write_text(
+                    json.dumps(deferred, indent=2)
+                )
+            except Exception:
+                pass
+
             transcript_path = collector.save()
             records_path = save_audio_turn_records(audio_records)
             status_path = save_transcript_status(
@@ -3052,6 +3536,12 @@ async def test_bot_greets_first_then_stays_responsive():
                 turn_count=interview_status["turns_completed"],
                 reached_cap=interview_status["reached_cap"],
                 captured_at=time.time(),
+                room_disconnected=bool(
+                    interview_status.get("room_disconnected")
+                ),
+                conclusion_reason=interview_status.get(
+                    "conclusion_reason"
+                ),
             )
             print(
                 f"Real transcript artifact: {transcript_path} "

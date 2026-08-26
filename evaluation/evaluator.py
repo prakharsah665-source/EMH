@@ -380,6 +380,23 @@ Do not give a score based on your general impression.
 Use the written rubric for each criterion.
 
 ============================================================
+PLATFORM ARTIFACTS VS INTERVIEWER BEHAVIOR
+============================================================
+
+The transcript was captured from a live audio interview and
+may contain speech-to-text artifacts: garbled or misspelled
+words, missing punctuation, duplicated fragments, or clipped
+sentences. These are transcription/platform artifacts.
+
+- Do NOT penalize the interviewer (or attribute poor
+  communication) for transcription artifacts.
+- Do NOT treat a candidate answer that looks garbled as a
+  weak answer; judge only how the interviewer responded to
+  it.
+- Base every judgment on the interviewer's own turns and the
+  conversational flow, not on audio/transcription quality.
+
+============================================================
 RUBRIC
 ============================================================
 

@@ -192,26 +192,34 @@ def save_transcript_status(
     turn_count: int,
     reached_cap: bool,
     captured_at: float,
+    room_disconnected: bool | None = None,
+    conclusion_reason: str | None = None,
     path: Path = TRANSCRIPT_STATUS_PATH,
 ) -> Path:
     """
     Persist whole-interview capture status so the evaluation
     layer can reject stale/truncated transcripts. `captured_at`
     is a unix timestamp supplied by the caller (the E2E test).
+    `room_disconnected`/`conclusion_reason` record WHY an
+    incomplete interview ended, so downstream classification can
+    distinguish a room/server disconnect (environment) from an
+    agent that died (bot failure).
     """
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "complete": complete,
+        "turn_count": turn_count,
+        "reached_cap": reached_cap,
+        "captured_at": captured_at,
+    }
+    if room_disconnected is not None:
+        payload["room_disconnected"] = room_disconnected
+    if conclusion_reason is not None:
+        payload["conclusion_reason"] = conclusion_reason
     path.write_text(
-        json.dumps(
-            {
-                "complete": complete,
-                "turn_count": turn_count,
-                "reached_cap": reached_cap,
-                "captured_at": captured_at,
-            },
-            indent=2,
-        ),
+        json.dumps(payload, indent=2),
         encoding="utf-8",
     )
     return path

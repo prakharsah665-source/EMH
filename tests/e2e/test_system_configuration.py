@@ -1,13 +1,13 @@
 import pytest
 from playwright.async_api import async_playwright
 
-from config.settings import INTERVIEW_URL
+from config.interview_session import tests_url_configured
 from evaluation.redaction import redact_pii
 from pages.interview_launch import LAUNCH_BUTTON_RE
 from tests.e2e.screenshots import save_screenshot
 from config.interview_session import (
     InterviewSessionError,
-    require_fresh_interview_url,
+    require_fresh_tests_url,
 )
 
 
@@ -250,12 +250,10 @@ async def test_system_configuration():
         Continue to Interview is inspected
     """
 
-    if not INTERVIEW_URL:
+    if not tests_url_configured():
         pytest.fail(
-            "INTERVIEW_URL is not configured.\n\n"
-            "Run:\n\n"
-            'export INTERVIEW_URL="YOUR_INTERVIEW_URL"\n\n'
-            "Then run the test again."
+            "No interview URL configured - set INTERVIEW_URL "
+            "(or the EMH_INTERVIEW_URL override)."
         )
 
     async with async_playwright() as playwright:
@@ -286,7 +284,7 @@ async def test_system_configuration():
             print("Opening interview...")
 
             try:
-                interview_url, _claims = require_fresh_interview_url()
+                interview_url, _claims = require_fresh_tests_url()
             except InterviewSessionError as error:
                 pytest.fail(str(error))
 

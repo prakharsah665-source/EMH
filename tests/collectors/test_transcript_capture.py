@@ -104,7 +104,10 @@ def test_livekit_capture_filters_binary_framing_noise(tmp_path):
     turns = LiveKitEventsCapture(path).get_turns()
     assert len(turns) == 1
     assert turns[0]["text"] == "What draws you to backend work?"
-    assert turns[0]["confidence"] == "medium"
+    # Agent-session captions are the agent's own record of what
+    # it said -> high (docs/bot_text_capture.md, "Provenance").
+    assert turns[0]["source"] == "livekit-agent-session"
+    assert turns[0]["confidence"] == "high"
 
 
 def test_livekit_capture_unavailable_without_file(tmp_path):
@@ -307,3 +310,100 @@ def test_livekit_capture_rejects_agent_session_framing(tmp_path):
     turns = capture.get_turns()
     assert len(turns) == 1
     assert "difficult bug" in turns[0]["text"]
+
+
+def test_livekit_capture_attributes_candidate_stt_to_user(tmp_path):
+    # Real packet shapes from a live capture (2026-08-19): the
+    # speaking participant's identity precedes the transcribed
+    # track id. "candidate-<id>" packets are the agent's STT of
+    # the candidate and must become USER turns; agent packets
+    # stay ASSISTANT turns. Speaker changes must never merge.
+    events = [
+        {"ev": "message", "label": "_reliable", "kind": "binary",
+         "text": ("agent-AJ_DxGc PA_mkhw:A agent-AJ_DxGc TR_AMJ8\" "
+                  "SG_3738 Hi my name is Rohan and I am your "
+                  "interviewer for today")},
+        {"ev": "message", "label": "_reliable", "kind": "binary",
+         "text": ("agent-AJ_DxGc PA_mkhw:f candidate-8866 TR_AMVE\" "
+                  "SG_162d .Hello Jamie, thank you, it's nice to "
+                  "meet you, I have 40 million events a day")},
+        {"ev": "message", "label": "_reliable", "kind": "binary",
+         "text": ("agent-AJ_DxGc PA_mkhw:B agent-AJ_DxGc TR_AMJ8\" "
+                  "SG_9999 What skills make you a strong fit for "
+                  "this role")},
+    ]
+    path = tmp_path / "events.json"
+    path.write_text(json.dumps(events))
+
+    turns = LiveKitEventsCapture(path).get_turns()
+    assert [t["role"] for t in turns] == ["assistant", "user", "assistant"]
+    user = turns[1]
+    assert user["source"] == "livekit-candidate-stt"
+    assert user["confidence"] == "high"
+    # Glue stripped, spoken numbers kept, identity token gone.
+    assert user["text"].startswith("Hello Jamie")
+    assert "40 million" in user["text"]
+    assert "candidate-8866" not in user["text"]
+
+
+def test_livekit_coalesce_keeps_head_when_first_caption_is_headless():
+    # Live capture 2026-08-21: the FIRST cumulative caption of an
+    # utterance can arrive without its leading word; later
+    # captions carry it. The head must be kept, not cut back to
+    # the first caption's anchor.
+    captions = [
+        "stakeholder-focused prioritization keeps the roadmap",
+        "AThat stakeholder-focused prioritization keeps the roadmap aligned",
+        "tThat stakeholder-focused prioritization keeps the roadmap aligned with real needs.",
+        "That stakeholder-focused prioritization keeps the roadmap aligned with real needs.",
+    ]
+    assert LiveKitEventsCapture._coalesce_captions(captions) == [
+        "That stakeholder-focused prioritization keeps the roadmap "
+        "aligned with real needs."
+    ]
+
+
+def test_livekit_coalesce_merges_caption_that_lost_leading_word():
+    # "Your experience aligning teams through" followed by a
+    # longer caption that dropped "Your " is the SAME utterance;
+    # the result must carry the original head.
+    captions = [
+        "Your experience aligning teams through",
+        "experience aligning teams through requirements and agile delivery comes through clearly.",
+    ]
+    assert LiveKitEventsCapture._coalesce_captions(captions) == [
+        "Your experience aligning teams through requirements and "
+        "agile delivery comes through clearly."
+    ]
+
+
+def test_livekit_candidate_answer_captured_once(tmp_path):
+    # The agent streams each SENTENCE of the candidate's answer
+    # as an interim caption, then one FINAL caption with the
+    # whole answer. One candidate answer -> one user turn.
+    def pkt(speaker, text):
+        return {
+            "ev": "message", "label": "_reliable", "kind": "binary",
+            "text": f"PA_mkhw:f {speaker} TR_AMVE SG_1 {text}",
+        }
+
+    events = [
+        pkt("agent-AJ_1", "Tell me about your experience with product management please"),
+        pkt("candidate-8866", "I have two years of experience working as a product manager."),
+        pkt("candidate-8866", "vMy background is focused on the software development life cycle."),
+        pkt("candidate-8866",
+            "I have two years of experience working as a product manager. "
+            "My background is focused on the software development life cycle."),
+        pkt("agent-AJ_1", "What skills make you a strong fit for this role today"),
+    ]
+    path = tmp_path / "events.json"
+    path.write_text(json.dumps(events))
+
+    turns = LiveKitEventsCapture(path).get_turns()
+    assert [t["role"] for t in turns] == ["assistant", "user", "assistant"]
+    assert turns[1]["text"] == (
+        "I have two years of experience working as a product manager. "
+        "My background is focused on the software development life cycle."
+    )
+    assert turns[0]["confidence"] == "high"
+    assert turns[0]["source"] == "livekit-agent-session"

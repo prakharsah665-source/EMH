@@ -70,8 +70,22 @@ SUITES = {
         "LLM-judged quality checks for individual "
         "interviewer behaviors: relevance, adaptability, "
         "professionalism, technical accuracy, context "
-        "retention, question repetition and more. "
+        "retention, question repetition and more, plus a "
+        "per-turn judgment of every interviewer utterance in "
+        "context (docs/interviewer_turn_evaluation.md). "
         "Judge: NVIDIA Nemotron, temperature=0.",
+    ),
+    "tests.simulator": (
+        "Candidate Simulator (stimulus validity)",
+        "Third scoring target, judged in its own Nemotron call "
+        "with its own rubric and blind to the persona label: "
+        "per-turn persona adherence / drift, meta-leakage, "
+        "role + seniority fit, monotonic separation "
+        "(strong > average > weak, CI-fail on inversion or "
+        "collapse) and, in robustness mode, adherence to the "
+        "adversarial spec (refusing to misbehave is a FAILURE). "
+        "These scores gate the validity of the interviewer "
+        "scores; they are never aggregated with them.",
     ),
     "tests.evaluation": (
         "Interview Quality Gate (CI)",
@@ -133,9 +147,13 @@ def ordered_test_paths() -> list[str]:
     then re-enter the same session as intentional
     continuation (they never join the room). Room-joining
     tests (continue_to_interview / interview_room / livekit)
-    run last within E2E and skip with SESSION ALREADY
-    CONSUMED unless EMH_ROOM_TESTS_URL provides an isolated
-    second session. Judging suites come after the capture.
+    run last within E2E and share ONE room join of
+    EMH_TESTS_URL (tests/e2e/shared_room.py): the first of
+    them joins the still-unjoined session, the others attach
+    to the same live room, and the browser leaves gracefully
+    once after the last of them. They only skip with SESSION
+    ALREADY CONSUMED when EMH_TESTS_URL was consumed before
+    the run. Judging suites come after the capture.
     """
 
     capture = ROOT / "tests/e2e/test_bot_responsiveness.py"
@@ -157,9 +175,11 @@ def ordered_test_paths() -> list[str]:
         *setup_screen_tests,
         *room_joiners,
         ROOT / "tests/config",
+        ROOT / "tests/e2e_offline",
         ROOT / "tests/collectors",
         ROOT / "tests/audio_eval",
         ROOT / "tests/security",
+        ROOT / "tests/simulator",
         ROOT / "tests/ai_quality",
         ROOT / "tests/api",
         ROOT / "tests/evaluation",
@@ -691,6 +711,70 @@ so a single inconsistent judgment cannot fail the build.
 
 
 # ============================================================
+# Session pre-flight
+# ============================================================
+
+def session_preflight() -> list[str]:
+    """
+    Validate the two-session setup BEFORE any browser opens.
+    Returns human-readable problems (empty list = OK).
+    """
+
+    from config.interview_session import (
+        InterviewSessionError,
+        consumed_session_entry,
+        require_fresh_interview_url,
+        require_fresh_tests_url,
+    )
+    from config.session_lock import current_holder
+
+    problems: list[str] = []
+    sessions = {}
+    for label, resolver in (
+        ("INTERVIEW_URL (full-interview evaluation)", require_fresh_interview_url),
+        ("EMH_TESTS_URL (isolated E2E tests)", require_fresh_tests_url),
+    ):
+        try:
+            _url, claims = resolver()
+        except InterviewSessionError as error:
+            problems.append(f"{label}: {error}")
+            continue
+        sessions[label] = claims
+        entry = consumed_session_entry(claims)
+        if entry:
+            problems.append(
+                f"{label}: session candidate {claims.candidate_id} / "
+                f"job {claims.job_id} was ALREADY USED "
+                f"('{entry.get('reason')}') - not fresh."
+            )
+        holder = current_holder(claims)
+        if holder:
+            problems.append(
+                f"{label}: session candidate {claims.candidate_id} / "
+                f"job {claims.job_id} is IN USE right now by "
+                f"'{holder.get('holder')}' (pid {holder.get('pid')})."
+            )
+
+    if len(sessions) == 2:
+        a, b = sessions.values()
+        if (a.candidate_id, a.job_id, a.issued_at) == (
+            b.candidate_id, b.job_id, b.issued_at
+        ):
+            problems.append(
+                "INTERVIEW_URL and EMH_TESTS_URL are the SAME session "
+                "- they must be two different fresh sessions."
+            )
+    if not problems:
+        print(
+            "Session pre-flight OK: full interview -> candidate "
+            f"{sessions[list(sessions)[0]].candidate_id}, isolated "
+            f"tests -> candidate {sessions[list(sessions)[1]].candidate_id} "
+            "(both fresh, distinct, unused)."
+        )
+    return problems
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -714,6 +798,22 @@ def main() -> int:
             "Provisioned a fresh interview session for this "
             "run (URL withheld - it contains the JWT)."
         )
+
+    # Pre-flight: the run needs TWO fresh, distinct, unused
+    # sessions - INTERVIEW_URL for the full interview and
+    # EMH_TESTS_URL for every other E2E test - and neither may
+    # be driven by another live harness process (one-tab lock).
+    problems = session_preflight()
+    if problems and os.getenv("EMH_ALLOW_STALE_INTERVIEW") != "1":
+        print("SESSION PRE-FLIGHT FAILED (environment, not a bot failure):")
+        for problem in problems:
+            print(f"  - {problem}")
+        print(
+            "Paste two FRESH interview URLs into INTERVIEW_URL and "
+            "EMH_TESTS_URL (or set EMH_ALLOW_STALE_INTERVIEW=1 to "
+            "deliberately override)."
+        )
+        return 2
 
     exit_code = run_pytest(sys.argv[1:])
 

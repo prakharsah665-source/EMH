@@ -11,7 +11,10 @@ from playwright.async_api import (
 from evaluation.redaction import redact_pii
 from tests.e2e.screenshots import save_screenshot
 
-from config.settings import INTERVIEW_URL
+from config.interview_session import (
+    InterviewSessionError,
+    require_fresh_tests_url,
+)
 
 
 # ============================================================
@@ -226,10 +229,11 @@ async def test_complete_interview():
     pytest-playwright plugin providing a `page` fixture).
     """
 
-    if not INTERVIEW_URL:
-        pytest.fail(
-            "INTERVIEW_URL environment variable is not configured."
-        )
+    # Same primary session as the full-interview evaluation.
+    try:
+        interview_url, _claims = require_fresh_tests_url()
+    except InterviewSessionError as error:
+        pytest.fail(str(error))
 
     async with async_playwright() as playwright:
 
@@ -261,7 +265,7 @@ async def test_complete_interview():
             print("Opening interview URL...")
 
             await page.goto(
-                INTERVIEW_URL,
+                interview_url,
                 wait_until="domcontentloaded",
                 timeout=30000,
             )

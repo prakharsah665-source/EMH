@@ -6,7 +6,11 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from config.settings import INTERVIEW_URL
+from config.interview_session import (
+    InterviewSessionError,
+    get_tests_url,
+    require_fresh_tests_url,
+)
 from evaluation.redaction import redact_pii
 from tests.e2e.screenshots import save_screenshot
 
@@ -315,7 +319,7 @@ async def run_interview_session(
         print("Opening interview URL...")
 
         await page.goto(
-            INTERVIEW_URL,
+            get_tests_url(),
             wait_until="domcontentloaded",
             timeout=30000,
         )
@@ -435,13 +439,11 @@ async def test_interview_permissions():
         Close session
     """
 
-    if not INTERVIEW_URL:
-        pytest.fail(
-            "INTERVIEW_URL is not set.\n\n"
-            "Run the test like this:\n\n"
-            'export INTERVIEW_URL="YOUR_INTERVIEW_URL"\n\n'
-            "pytest tests/e2e/test_interview_permissions.py -v -s"
-        )
+    # Same primary session as the full-interview evaluation.
+    try:
+        require_fresh_tests_url()
+    except InterviewSessionError as error:
+        pytest.fail(str(error))
 
     async with async_playwright() as playwright:
 

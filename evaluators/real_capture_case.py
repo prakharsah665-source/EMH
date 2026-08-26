@@ -104,6 +104,18 @@ def real_capture_turns(
     assistant = sum(1 for t in turns if t["role"] == "assistant")
     user = sum(1 for t in turns if t["role"] == "user")
 
+    # Cross-check capture vs drive: a COMPLETE interview whose
+    # capture channel caught only a fragment must not be judged
+    # as the whole interview - missing turns mean "not captured",
+    # never "never asked". Capture limitation -> skip.
+    from evaluation.transcript_validation import (
+        capture_coverage_problem,
+    )
+
+    coverage_problem = capture_coverage_problem(user, status)
+    if coverage_problem:
+        pytest.skip(f"{test_label}: {coverage_problem}")
+
     if assistant < min_assistant_turns or user < min_user_turns:
         pytest.skip(
             f"{test_label}: capture backend "

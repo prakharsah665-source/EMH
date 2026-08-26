@@ -6,11 +6,18 @@ from playwright.async_api import async_playwright
 from evaluation.redaction import redact_pii
 from tests.e2e.screenshots import save_screenshot
 
-from config.settings import INTERVIEW_URL
-from pages.interview_launch import LAUNCH_BUTTON_RE
+from config.interview_session import (
+    get_tests_url,
+    tests_url_configured,
+)
+from pages.interview_launch import (
+    LAUNCH_BUTTON_RE,
+    TOUR_SUPPRESS_JS,
+    _dismiss_guided_tour,
+)
 from config.interview_session import (
     InterviewSessionError,
-    require_fresh_interview_url,
+    require_fresh_tests_url,
 )
 
 
@@ -24,10 +31,10 @@ def _interview_origin():
     state at "prompt".
     """
 
-    if not INTERVIEW_URL:
+    if not tests_url_configured():
         return None
 
-    parts = urlparse(INTERVIEW_URL)
+    parts = urlparse(get_tests_url())
 
     return f"{parts.scheme}://{parts.netloc}"
 
@@ -199,6 +206,50 @@ async def verify_media_access(page):
 
     print(
         "Camera and microphone access is working."
+    )
+
+
+_NO_VISIBLE_TOUR_JS = """
+    () => {
+        const parts = document.querySelectorAll(
+            '#react-joyride-portal, ' +
+            '.react-joyride__overlay, ' +
+            '.react-joyride__spotlight, ' +
+            '.react-joyride__beacon, .__floater'
+        );
+        return Array.from(parts).every(
+            el => el.getClientRects().length === 0
+        );
+    }
+"""
+
+
+async def ensure_tour_suppressed(page):
+    """
+    Make sure no React Joyride element can intercept pointer
+    events before we click anything on the setup screen.
+
+    The app has more than one guided tour and their steps mount
+    at unpredictable times (the setup-screen tour renders its
+    spotlight AFTER System Configuration appears, right over the
+    'Test Speaker Before Interview' button). Re-inject the CSS
+    suppression, actively dismiss any tour that mounted before
+    the CSS landed, then wait until every joyride element is
+    invisible (zero client rects) so the click cannot race a
+    late-mounting spotlight.
+    """
+
+    await page.evaluate(TOUR_SUPPRESS_JS)
+
+    await _dismiss_guided_tour(page, print)
+
+    await page.wait_for_function(
+        _NO_VISIBLE_TOUR_JS,
+        timeout=10000,
+    )
+
+    print(
+        "Guided tour suppressed - no Joyride element visible."
     )
 
 
@@ -545,6 +596,11 @@ async def click_speaker_test(page):
         "Looking for speaker test..."
     )
 
+    # The setup-screen tour can mount its spotlight at any
+    # point after System Configuration renders; make sure it
+    # is gone IMMEDIATELY before the click, not just earlier.
+    await ensure_tour_suppressed(page)
+
     button = await find_speaker_test_button(
         page
     )
@@ -749,13 +805,11 @@ async def test_audio_configuration():
         Verify Continue button
     """
 
-    if not INTERVIEW_URL:
+    if not tests_url_configured():
 
         pytest.fail(
-            "INTERVIEW_URL is not set.\n\n"
-            "Run:\n\n"
-            'export INTERVIEW_URL="YOUR_INTERVIEW_URL"\n\n'
-            "Then run the test."
+            "No interview URL configured - set INTERVIEW_URL "
+            "(or the EMH_INTERVIEW_URL override)."
         )
 
     async with async_playwright() as playwright:
@@ -790,15 +844,26 @@ async def test_audio_configuration():
             )
 
             try:
-                interview_url, _claims = require_fresh_interview_url()
+                interview_url, _claims = require_fresh_tests_url()
             except InterviewSessionError as error:
                 pytest.fail(str(error))
+
+            # Prevent the guided tour BEFORE any app code can
+            # render it: CSS suppression on this load and any
+            # later navigation.
+            await page.add_init_script(TOUR_SUPPRESS_JS)
 
             await page.goto(
                 interview_url,
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
+
+            # Belt and suspenders: init scripts do not run on a
+            # page that already navigated before they were
+            # added, so apply the suppression to this document
+            # too.
+            await page.evaluate(TOUR_SUPPRESS_JS)
 
             print(
                 "Interview page loaded."
@@ -844,6 +909,11 @@ async def test_audio_configuration():
             # =================================================
             # 5. System Configuration
             # =================================================
+
+            # The setup-screen tour mounts after System
+            # Configuration renders - dismiss it before any
+            # interaction on this screen.
+            await ensure_tour_suppressed(page)
 
             await verify_system_configuration(
                 page

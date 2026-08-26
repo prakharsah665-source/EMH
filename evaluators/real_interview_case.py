@@ -1,84 +1,78 @@
 """
-Shared loader that turns the REAL captured EMH transcript
-(artifacts/transcripts/actual_transcript.json, written by the
-bot-responsiveness E2E run) into a DeepEval test case.
+Shared loader that turns the REAL captured EMH transcript into a
+DeepEval test case for the whole-interview quality tests.
 
-A real transcript is mandatory: callers get a hard failure with
-the capture command instead of a silent synthetic fallback.
+Reads through the TranscriptCapture layer (select_capture), NOT
+the DOM-scrape file artifacts/transcripts/actual_transcript.json:
+the app renders no bot text in the DOM, so that file never holds
+interviewer turns and every whole-interview judgment built on it
+skipped as "TRUNCATED - 0 interviewer turns". The LiveKit data
+channel (preferred backend) carries both the bot's captions and
+the agent's own STT of the candidate, identity-tagged.
+
+A real capture is mandatory: callers get a hard failure with the
+capture command instead of a silent synthetic fallback. Status,
+provenance, coverage and minimum-turn gates are the ones shared
+with the per-dimension tests (evaluators.real_capture_case).
 """
 
 import pytest
 
 from deepeval.test_case import LLMTestCase
 
-from evaluation.transcript import (
-    get_transcript_path,
-    load_real_transcript,
-)
-from evaluation.transcript_validation import (
-    TranscriptValidationError,
-    classify_status_for_scoring,
+from collectors.transcript_capture import select_capture
+from evaluators.real_capture_case import (
+    INTERVIEW_CONTEXT,
+    format_capture_turns,
+    real_capture_turns,
 )
 
-
-INTERVIEW_CONTEXT = (
-    "A real technical interview conducted by the EMH AI "
-    "interviewer (Jamie). The interviewer is expected to run a "
-    "professional, relevant, technically accurate, context-aware "
-    "and adaptive multi-turn interview, starting from the "
-    "candidate's introduction."
-)
+__all__ = [
+    "INTERVIEW_CONTEXT",
+    "require_real_transcript",
+    "real_interview_test_case",
+]
 
 
-def require_real_transcript() -> str:
+def require_real_transcript(
+    *,
+    test_label: str = "real_interview",
+    min_confidence: str = "medium",
+    exclude_sources: tuple[str, ...] = (),
+) -> str:
     """
-    Load the captured transcript or fail the calling test with
-    the exact command needed to produce it.
+    Load the captured transcript (provenance-tagged, evaluator-
+    ready text) or fail the calling test with the exact command
+    needed to produce it.
     """
 
-    path = get_transcript_path()
-
-    if not path.exists():
+    try:
+        capture = select_capture()
+    except RuntimeError as error:
         pytest.fail(
             "\n"
             "REAL TRANSCRIPT MISSING\n"
-            f"No captured EMH transcript at {path}.\n"
+            f"No usable EMH capture backend: {error}\n"
             "Run the E2E capture first:\n"
             "    pytest tests/e2e/test_bot_responsiveness.py -s\n"
-            "(or set EMH_TRANSCRIPT_PATH). AI-quality tests do "
-            "not score synthetic transcripts."
+            "AI-quality tests do not score synthetic transcripts."
         )
 
-    print(f"\nUsing real EMH transcript: {path}")
+    print(f"\nUsing real EMH transcript backend: {capture.name}")
 
-    # Same status rule as the CI gate: incomplete capture ->
-    # SKIP (the upstream bot/capture failure is already
-    # reported by the capture test - do not duplicate it once
-    # per quality dimension); missing/stale status -> FAIL at
-    # the capture/session layer.
-    verdict, reason = classify_status_for_scoring()
-    if verdict == "skip-upstream":
-        pytest.skip(f"NOT JUDGED - {reason}")
-    if verdict != "ok":
-        pytest.fail(
-            "\nTRANSCRIPT NOT SCORABLE\n"
-            f"{reason}\n"
-        )
-
-    try:
-        return load_real_transcript(path)
-    except TranscriptValidationError as error:
-        pytest.skip(
-            "NOT JUDGED - the capture is fresh and complete "
-            "but its transcript cannot be judged as a whole "
-            "interview (CAPTURE LIMITATION, not a bot "
-            f"failure): {error} "
-            "See docs/bot_text_capture.md."
-        )
+    # Status (fresh/complete), provenance floor, capture-coverage
+    # and minimum-turn gates - identical to the per-dimension
+    # tests so both families judge the same turns.
+    turns = real_capture_turns(
+        test_label=test_label,
+        min_confidence=min_confidence,
+        exclude_sources=exclude_sources,
+    )
+    return format_capture_turns(turns)
 
 
-def real_interview_test_case() -> LLMTestCase:
+def real_interview_test_case(**kwargs) -> LLMTestCase:
     return LLMTestCase(
         input=INTERVIEW_CONTEXT,
-        actual_output=require_real_transcript(),
+        actual_output=require_real_transcript(**kwargs),
     )

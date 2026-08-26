@@ -193,21 +193,59 @@ async def _feed_mic_check(page, log) -> None:
     if not has_speak:
         return
 
-    # Imported lazily so non-audio tests need no audio fixtures.
-    # Best-effort: a fixture/import problem must not abort launch.
+    # Imported lazily so non-audio tests need no audio synthesis.
+    # Any short spoken clip will do (this is the setup-screen mic
+    # check, not a candidate answer). Best-effort: a synth problem
+    # must not abort launch.
     try:
-        from tests.e2e.test_bot_responsiveness import (
-            ensure_answer_fixtures,
-            fixture_base64,
-        )
+        import base64
 
-        clip = ensure_answer_fixtures(1)[0]
+        from simulator.live_answers import synthesize_speech_wav
+
+        clip = synthesize_speech_wav(
+            "Microphone check, one two three, testing the microphone."
+        )
         await page.evaluate(
-            "b => window.__emhSpeak(b)", fixture_base64(clip)
+            "b => window.__emhSpeak(b)",
+            base64.b64encode(clip.read_bytes()).decode("ascii"),
         )
         log("Microphone check clip played (setup screen only).")
     except Exception as error:  # fixtures unavailable / synth failed
         log(f"[WARNING] Skipped fake-mic check clip: {error}")
+
+
+async def graceful_leave_interview_room(page, log=None) -> None:
+    """
+    Gracefully LEAVE the interview room before teardown.
+
+    Closing the browser outright kills the sockets mid-stream:
+    the app never sends its LiveKit leave / socket.io disconnect,
+    so the server keeps the interview session (and its agent)
+    alive in the room - a later rejoin is greeted with "I noticed
+    we had a dropout". Navigating the page away first fires the
+    app's pagehide/unload handlers, so the leave/disconnect
+    packets go out and the participant exits the room cleanly.
+    Exception-safe: teardown must never fail the test.
+    """
+
+    say = log or (lambda _message: None)
+    try:
+        if page.is_closed():
+            return
+        await page.goto(
+            "about:blank",
+            wait_until="domcontentloaded",
+            timeout=10_000,
+        )
+        # Give the leave/disconnect packets a moment to flush
+        # before the browser process goes away.
+        await page.wait_for_timeout(1_500)
+        say(
+            "Graceful room leave: page navigated away, LiveKit/"
+            "socket disconnects flushed before browser close."
+        )
+    except Exception as error:
+        say(f"[WARNING] Graceful room leave skipped: {error}")
 
 
 async def launch_into_interview_room(
@@ -480,6 +518,29 @@ async def launch_into_interview_room(
             "enabled (a setup step above may not really have "
             "completed).\n" + await _page_hint(page),
         ) from error
+
+    # BARRIER: no setup-screen audio may cross into the live
+    # room. The mic-check clip above is awaited to completion,
+    # but any clip still playing on the fake mic here (timeout
+    # paths, future changes) is explicitly stopped BEFORE the
+    # room is joined, so it can never reach the candidate's
+    # live transcript.
+    mic_guard = await page.evaluate(
+        """
+        () => {
+            const playing = !!(window.__emh && window.__emh.mic
+                && window.__emh.mic.playing);
+            const stopped = !!(window.__emhStopSpeak
+                && window.__emhStopSpeak());
+            return { playing, stopped };
+        }
+        """
+    )
+    if mic_guard["playing"] or mic_guard["stopped"]:
+        log(
+            "[WARNING] Fake-mic audio was still playing at room "
+            "join - explicitly stopped before entering the room."
+        )
 
     await continue_button.click()
 

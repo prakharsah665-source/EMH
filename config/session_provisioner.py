@@ -13,10 +13,10 @@ adds:
    provisioning endpoint is configured, otherwise returns None
    so callers fall back to the manual URL. The exact endpoint
    the EMH backend needs to expose is documented below.
-2. isolated_room_test_url() - optional second session for the
-   few tests that genuinely require joining the interview room
-   in isolation AFTER the full-interview evaluation consumed
-   the primary session (EMH_ROOM_TESTS_URL).
+2. isolated_room_test_url() - the SECOND fresh session
+   (EMH_TESTS_URL) used by every isolated E2E test (setup
+   screens, interview room, LiveKit) so nothing shares the
+   full-interview session.
 
 REQUIRED PROVISIONING ENDPOINT (not yet available)
 --------------------------------------------------
@@ -119,14 +119,13 @@ def provision_interview_url() -> str | None:
 
 def isolated_room_test_url() -> str | None:
     """
-    Optional SECOND fresh session for room-joining tests that
-    run after the full-interview evaluation consumed the
-    primary session. Returns None when not configured - those
-    tests then skip with SESSION ALREADY CONSUMED instead of
-    producing false bot failures.
+    The SECOND fresh session (EMH_TESTS_URL, legacy name
+    EMH_ROOM_TESTS_URL) for isolated E2E tests. Returns None
+    when not configured - those tests then skip with a session-
+    policy reason instead of producing false bot failures.
     """
 
-    url = os.getenv("EMH_ROOM_TESTS_URL")
+    url = os.getenv("EMH_TESTS_URL") or os.getenv("EMH_ROOM_TESTS_URL")
     if not url:
         return None
     decode_interview_claims(url)

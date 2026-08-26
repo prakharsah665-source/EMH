@@ -28,7 +28,7 @@ CAPTURE TIME (evaluation.redaction).
 
 Backend selection: EMH_TRANSCRIPT_CAPTURE = livekit | app-api |
 dom | stt | auto (default). "auto" picks the first available of
-livekit -> app-api -> dom.
+livekit -> app-api -> stt -> dom.
 """
 
 import json
@@ -72,7 +72,7 @@ TRANSCRIPT_HOOK_JS = """
   if (window.__emhTranscriptEvents) return;
   window.__emhTranscriptEvents = [];
   const push = (entry) => {
-    if (window.__emhTranscriptEvents.length < 5000) {
+    if (window.__emhTranscriptEvents.length < 20000) {
       window.__emhTranscriptEvents.push(entry);
     }
   };
@@ -581,8 +581,13 @@ class LiveKitEventsCapture(TranscriptCapture):
     PREFERRED. Parses the data-channel events recorded by
     TRANSCRIPT_HOOK_JS during the capture run. String payloads
     (LiveKit chat / lk.transcription streams) are high
-    confidence; printable runs extracted from binary protobuf
-    packets are medium confidence.
+    confidence. Printable runs extracted from binary protobuf
+    packets are attributed by participant marker and are ALSO
+    high confidence: "candidate-*" packets are the agent's own
+    STT of the candidate (what the bot heard), "agent-*" /
+    unattributed packets are the agent's own caption stream of
+    its utterances (what the bot said). Neither is a harness
+    transcription - see docs/bot_text_capture.md, "Provenance".
     """
 
     name = "livekit"
@@ -591,6 +596,8 @@ class LiveKitEventsCapture(TranscriptCapture):
     # speech (participant identities, stream ids, topics).
     _NOISE_PREFIXES = (
         "PA_", "TR_", "lk.", "agent-", "identity",
+        # Agent metrics packets name the providers in use.
+        "api.", "ElevenLabs", "gpt-", "livekit",
     )
 
     # Tokens that mark a printable run as protocol framing
@@ -598,8 +605,15 @@ class LiveKitEventsCapture(TranscriptCapture):
     # 'lk.agent.session' data streams, 2026-08-14: the runs are
     # ids/topics/mimetypes; conversation text lives inside the
     # binary stream payloads, not in the printable runs).
+    # Digit rule: any digit-bearing token is framing (ids,
+    # uuids, "gpt-4o", "SG_162d77e32895") UNLESS it is a plain
+    # spoken number / short unit ("40", "2019", "1.5", "40,000",
+    # "p99", "10x", "3rd") - those are speech and must survive
+    # so candidate answers keep their numbers.
     _FRAMING_TOKEN_RE = re.compile(
-        r"^\$|^item_|^AS_|^AJ_|^emh_|/|_|\d"
+        r"^\$|^item_|^AS_|^AJ_|^emh_|/|_|[{}]|^[\w-]+\.[\w-]+\.[\w.-]+$"
+        r"|^(?!(?:[\d.,:%$+-]+|[A-Za-z]{1,2}\d{1,3}|\d{1,4}[A-Za-z]{1,2})$)"
+        r"(?=\S*\d)"
     )
 
     # Agent-side diagnostics streamed over the same channel
@@ -610,6 +624,32 @@ class LiveKitEventsCapture(TranscriptCapture):
         r"label='|error=|APIStatusError|APIConnectionError"
         r"|Traceback|Exception"
     )
+
+    # Speaker attribution for binary transcription packets.
+    # Verified against a live capture (2026-08-19): every
+    # legacy lk.transcription packet names the SPEAKING
+    # participant right before the transcribed track id, e.g.
+    #   "... PA_xxx:f candidate-8866 TR_AMVE... SG_162d ... Hello Jamie"
+    #   "... PA_xxx:A agent-AJ_DxGc... TR_AMJ8... SG_3738 ... Hi my name"
+    # "candidate-<id>" packets are the EMH agent's OWN STT of
+    # the candidate - i.e. what the bot actually heard - and
+    # are the authoritative source for candidate answers.
+    _SPEAKER_RE = re.compile(
+        r"\b(candidate-[A-Za-z0-9_]+|agent-[A-Za-z0-9_]+)\s+TR_"
+    )
+
+    @classmethod
+    def _speaker_role(cls, text: str) -> str | None:
+        """
+        "user" when the packet is attributed to the candidate
+        participant, "assistant" when attributed to the agent,
+        None when the packet carries no speaker marker.
+        """
+
+        match = cls._SPEAKER_RE.search(text)
+        if not match:
+            return None
+        return "user" if match.group(1).startswith("candidate-") else "assistant"
 
     @classmethod
     def _sentence_words(cls, text: str) -> list[str]:
@@ -713,12 +753,20 @@ class LiveKitEventsCapture(TranscriptCapture):
         def same_utterance(prev: str, current: str) -> bool:
             # Cumulative captions share almost all of the
             # previous caption's text; chunk boundaries may
-            # shave a few leading chars and append new tail
-            # text, so match on interior slices.
+            # shave leading chars OR a whole leading word
+            # ("Your experience aligning" -> "experience
+            # aligning ...") and append new tail text, so match
+            # on a sliding interior window of the previous
+            # caption rather than one fixed slice.
             if prev[2:60] and prev[2:60] in current:
                 return True
             if len(prev) > 40 and prev[-36:-8] in current:
                 return True
+            window = 20
+            for start in range(0, max(1, len(prev) - window), 6):
+                piece = prev[start:start + window]
+                if len(piece) >= window and piece in current:
+                    return True
             return False
 
         groups: list[list[str]] = []
@@ -736,7 +784,47 @@ class LiveKitEventsCapture(TranscriptCapture):
             longest = max(group, key=len)
             anchor = group[0][:12]
             index = longest.find(anchor) if anchor else -1
-            text = longest[index:] if index > 0 else longest
+            if index > 0:
+                # Text in front of the anchor is protobuf glue
+                # (1-2 chars) - UNLESS it is a whole word: the
+                # FIRST caption can itself arrive headless
+                # ("stakeholder-focused ..." when later captions
+                # read "That stakeholder-focused ...") and the
+                # head must be kept, not cut away.
+                prefix = longest[:index]
+                if len(prefix) >= 3 and prefix.rstrip() and prefix[-1] == " ":
+                    text = longest
+                else:
+                    text = longest[index:]
+            else:
+                text = longest
+                # The longest caption may have LOST its head at
+                # a chunk boundary ("experience aligning ..."
+                # when the first caption read "Your experience
+                # aligning ..."): re-attach the earliest
+                # caption's prefix in front of the overlap.
+                head = longest[:20]
+                first = group[0]
+                at = first.find(head) if len(head) >= 20 else -1
+                if at > 0 and first is not longest:
+                    text = first[:at] + longest
+            # Leading one-char protobuf glue that survived the
+            # anchor step (".Hello", "nI'm", "qAnd"): a
+            # non-alphanumeric char, or a lowercase letter
+            # immediately followed by an uppercase letter, is
+            # never how a caption starts.
+            if len(text) > 3 and (
+                (not text[0].isalnum() and text[1].isalpha())
+                or (text[0].islower() and text[1].isupper())
+                # "MI'd", "NWhen", "YOn": an uppercase glue char
+                # in front of a capitalised word.
+                or (
+                    text[0].isupper()
+                    and text[1].isupper()
+                    and (text[2].islower() or text[2] == "'")
+                )
+            ):
+                text = text[1:]
             # Trailing protobuf glue (e.g. "yourself?(").
             end = len(text)
             while end > 0 and not (
@@ -747,7 +835,39 @@ class LiveKitEventsCapture(TranscriptCapture):
             while end > 0 and text[end - 1] in "()":
                 end -= 1
             finals.append(text[:end].strip())
-        return finals
+        return LiveKitEventsCapture._drop_interim_finals(finals)
+
+    @staticmethod
+    def _drop_interim_finals(finals: list[str]) -> list[str]:
+        """
+        The agent's candidate STT streams each SENTENCE as its
+        own interim caption, then one FINAL caption holding the
+        whole answer. Drop any caption whose text is contained
+        in a later caption of the same group so each answer is
+        captured once; captions that are never superseded
+        (no final arrived) are kept.
+        """
+
+        def norm(text: str) -> str:
+            return " ".join(
+                "".join(ch for ch in text.lower() if ch.isalnum() or ch == " ").split()
+            )
+
+        kept: list[str] = []
+        normed = [norm(f) for f in finals]
+        for i, text in enumerate(finals):
+            # A fragment may have lost its first word at a chunk
+            # boundary; containment of its interior is enough.
+            probe = normed[i]
+            if len(probe) > 30:
+                probe = probe[6:-4]
+            superseded = any(
+                probe and probe in normed[j] and len(normed[j]) > len(normed[i])
+                for j in range(i + 1, len(finals))
+            )
+            if not superseded:
+                kept.append(text)
+        return kept
 
     def available(self) -> bool:
         return bool(self._speech_events())
@@ -756,25 +876,58 @@ class LiveKitEventsCapture(TranscriptCapture):
         turns: list[dict[str, Any]] = []
         pending_captions: list[str] = []
         pending_ts: float | None = None
+        # Speaker of the pending caption group ("assistant" /
+        # "user"); None until the first attributed packet.
+        pending_role: str | None = None
 
         def flush_captions() -> None:
-            nonlocal pending_captions, pending_ts
-            for text in self._coalesce_captions(pending_captions):
-                if len(text) >= 12:
+            nonlocal pending_captions, pending_ts, pending_role
+            role = pending_role or "assistant"
+            # A contiguous run of one speaker's captions is ONE
+            # conversational turn (a bot utterance / a candidate
+            # answer); the agent emits it as several utterance
+            # groups (sentence-level interim STT, re-streamed
+            # finals), so join the surviving captions.
+            pieces = [
+                text
+                for text in self._coalesce_captions(pending_captions)
+                if len(text) >= 12
+            ]
+            for text in ([" ".join(pieces)] if pieces else []):
+                if True:
+                    if role == "user":
+                        # The agent's own STT of the candidate:
+                        # the authoritative record of what the
+                        # bot heard. Same provenance class as
+                        # app-rendered STT -> high.
+                        source = "livekit-candidate-stt"
+                        confidence = "high"
+                    else:
+                        # Binary captions without a candidate
+                        # marker come from the AGENT session
+                        # stream: the text the agent itself
+                        # emitted for its own utterance (the
+                        # TTS input), not a transcription of
+                        # its audio. That is the authoritative
+                        # record of what the bot said - the
+                        # same provenance class as the agent's
+                        # own STT of the candidate -> high.
+                        # (Promoted 2026-08-21; see
+                        # docs/bot_text_capture.md.)
+                        source = "livekit-agent-session"
+                        confidence = "high"
                     turns.append(
                         make_turn(
-                            # Binary captions come from the
-                            # AGENT session stream (the bot's
-                            # own utterances).
-                            role="assistant",
+                            role=role,
                             text=text,
                             ts=pending_ts,
-                            source="livekit-agent-session",
-                            confidence="medium",
+                            source=source,
+                            confidence=confidence,
                         )
                     )
             pending_captions = []
             pending_ts = None
+            pending_role = None
 
         for event in self._speech_events():
             text = event["text"].strip()
@@ -818,9 +971,24 @@ class LiveKitEventsCapture(TranscriptCapture):
                 )
                 continue
 
+            # Speaker attribution BEFORE cleaning (the identity
+            # token is framing and is stripped by _caption_text).
+            speaker = self._speaker_role(text)
             caption = self._caption_text(text)
             if len(self._sentence_words(caption)) < 5:
                 continue
+            # A speaker change closes the pending caption group
+            # so candidate STT is never merged into a bot turn
+            # (or vice versa). Unattributed packets stay with
+            # the current speaker.
+            if (
+                speaker is not None
+                and pending_role is not None
+                and speaker != pending_role
+            ):
+                flush_captions()
+            if pending_role is None and speaker is not None:
+                pending_role = speaker
             if pending_ts is None:
                 pending_ts = event.get("ts")
             pending_captions.append(caption)
@@ -983,8 +1151,10 @@ class SttCapture(TranscriptCapture):
             self._entries(),
             key=lambda item: (
                 item.get("turn") or 0,
-                # greeting/assistant before the same-numbered
-                # candidate answer keeps conversational order.
+                # Within the same turn number the candidate's
+                # answer precedes the bot reply that responds to
+                # it (the greeting is turn 0, which has no user
+                # entry), so user sorts before assistant.
                 0 if item.get("role") == "user" else 1,
             ),
         ):
@@ -1025,7 +1195,7 @@ def select_capture() -> TranscriptCapture:
     """
     Resolve the transcript source from EMH_TRANSCRIPT_CAPTURE
     (default "auto": first available of livekit -> app-api ->
-    dom). Raises RuntimeError - an evaluator/environment
+    stt -> dom). Raises RuntimeError - an evaluator/environment
     classification, never a bot failure - when nothing is
     available.
     """
