@@ -1,7 +1,5 @@
-import os
 import time
 
-from dotenv import load_dotenv
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -10,13 +8,17 @@ from openai import (
     RateLimitError,
 )
 
-
-load_dotenv()
+from config.settings import (
+    JUDGE_API_KEY,
+    JUDGE_BASE_URL,
+    JUDGE_MODEL,
+)
 
 
 class NvidiaInferenceError(RuntimeError):
     """
-    NVIDIA API / inference failure.
+    NVIDIA API / inference failure (the judge model, GPT-OSS,
+    is served by the NVIDIA NIM endpoint).
 
     This is an infrastructure failure, NOT an interview
     quality failure. Callers must report it separately from
@@ -46,29 +48,16 @@ def _is_transient(error: Exception) -> bool:
     return False
 
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-
-NVIDIA_BASE_URL = os.getenv(
-    "NVIDIA_BASE_URL",
-    "https://integrate.api.nvidia.com/v1",
-)
-
-NVIDIA_MODEL = os.getenv(
-    "NVIDIA_MODEL",
-    "nvidia/nemotron-3-nano-30b-a3b",
-)
-
-
-if not NVIDIA_API_KEY:
+if not JUDGE_API_KEY:
     raise RuntimeError(
-        "NVIDIA_API_KEY is not configured. "
-        "Add NVIDIA_API_KEY to your .env file."
+        "API_KEY (judge model key) is not configured. "
+        "Add API_KEY, BASE_URL and MODEL_NAME to your .env file."
     )
 
 
 client = OpenAI(
-    base_url=NVIDIA_BASE_URL,
-    api_key=NVIDIA_API_KEY,
+    base_url=JUDGE_BASE_URL,
+    api_key=JUDGE_API_KEY,
 )
 
 
@@ -77,7 +66,8 @@ def evaluate_with_nvidia(
     response_format: dict | None = None,
 ) -> str:
     """
-    Send an evaluation prompt to NVIDIA Nemotron.
+    Send an evaluation prompt to the judge model (GPT-OSS on
+    the NVIDIA NIM endpoint, MODEL_NAME in .env).
 
     When a response_format is provided (e.g. a json_schema
     built from the rubric), it is enforced server-side so
@@ -102,8 +92,12 @@ def evaluate_with_nvidia(
 
         try:
 
+            # GPT-OSS keeps its chain-of-thought in
+            # message.reasoning_content; message.content holds
+            # only the answer (verified 2026-09-08), so no
+            # Nemotron-style reasoning_budget / thinking flags.
             completion = client.chat.completions.create(
-                model=NVIDIA_MODEL,
+                model=JUDGE_MODEL,
                 messages=[
                     {
                         "role": "user",
@@ -113,9 +107,6 @@ def evaluate_with_nvidia(
                 temperature=0,
                 top_p=1,
                 max_tokens=16384,
-                extra_body={
-                    "reasoning_budget": 16384,
-                },
                 stream=False,
                 **extra_kwargs,
             )
@@ -177,7 +168,8 @@ def evaluate_with_nvidia(
 
 def test_nvidia_connection() -> str:
     """
-    Verify that NVIDIA Nemotron is reachable.
+    Verify that the judge model is reachable on the NVIDIA
+    endpoint.
     """
 
     prompt = """
@@ -194,11 +186,11 @@ Do not provide anything else.
 if __name__ == "__main__":
 
     print("=" * 60)
-    print("NVIDIA NEMOTRON CONNECTION TEST")
+    print("JUDGE MODEL CONNECTION TEST (NVIDIA endpoint)")
     print("=" * 60)
 
-    print(f"Model: {NVIDIA_MODEL}")
-    print(f"Base URL: {NVIDIA_BASE_URL}")
+    print(f"Model: {JUDGE_MODEL}")
+    print(f"Base URL: {JUDGE_BASE_URL}")
     print()
 
     try:

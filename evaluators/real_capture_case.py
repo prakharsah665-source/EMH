@@ -156,7 +156,7 @@ def judge_real_dimension(
 ) -> dict:
     """
     Judge one quality dimension over the real captured
-    transcript with the shared Nemotron judge: 3-run median,
+    transcript with the shared GPT-OSS judge: 3-run median,
     disagreement asserted (see consistent_geval).
     """
 

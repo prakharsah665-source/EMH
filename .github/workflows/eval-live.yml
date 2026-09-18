@@ -3,11 +3,15 @@ name: "Evaluation (Live: Responsiveness + AI Quality)"
 # Live pipeline gated behind secrets. It runs the bot-
 # responsiveness E2E against the real EMH interview, captures the
 # REAL transcript, then evaluates that transcript with the
-# Nemotron judge (3-run median) and runs judge calibration.
+# GPT-OSS judge (3-run median) and runs judge calibration.
 #
 # Manual (workflow_dispatch) or nightly. Requires repo secrets:
 #   INTERVIEW_URL   - the EMH interview URL (contains the JWT)
-#   NVIDIA_API_KEY  - Nemotron judge credits
+#   JUDGE_API_KEY   - NVIDIA NIM key for the GPT-OSS judge
+#   JUDGE_BASE_URL  - https://integrate.api.nvidia.com/v1
+#   JUDGE_MODEL     - openai/gpt-oss-20b
+# They are exported under the generic names the code reads
+# from .env (API_KEY / BASE_URL / MODEL_NAME).
 # The quality job consumes the transcript artifact produced by
 # the responsiveness job, so AI quality is always evaluated on
 # REAL captured output (no synthetic fallback).
@@ -56,9 +60,9 @@ jobs:
     needs: bot-responsiveness
     runs-on: ubuntu-latest
     env:
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      NVIDIA_BASE_URL: ${{ secrets.NVIDIA_BASE_URL }}
-      NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
+      API_KEY: ${{ secrets.JUDGE_API_KEY }}
+      BASE_URL: ${{ secrets.JUDGE_BASE_URL }}
+      MODEL_NAME: ${{ secrets.JUDGE_MODEL }}
       INTERVIEW_URL: ${{ secrets.INTERVIEW_URL }}
     steps:
       - uses: actions/checkout@v4
@@ -91,6 +95,6 @@ jobs:
             tests/security/test_transcript_security_audit.py \
             -v
 
-      - name: Audio metrics on real captured artifacts
+      - name: Audio  on real captured artifacts
         run: |
           python -m pytest tests/audio_eval/test_real_artifacts.py -v

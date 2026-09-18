@@ -26,7 +26,7 @@ filter_turns()             keep interviewer turns; candidate turns kept ONLY if
                            "(candidate response not captured)" boundary
 build_interviewer_turns()  one unit per interviewer utterance + verbatim preceding context
 build_turn_prompt()        ONE prompt, every turn judged independently
-nemotron_judge()           NVIDIA Nemotron, temperature 0, json_schema enforced
+default_judge()            GPT-OSS via NVIDIA NIM (MODEL_NAME in .env), temperature 0, json_schema enforced
 validate_turn_result()     count/numbering/score range/issue types
 aggregate_scores()         mean of MODEL scores, issue counts, flagged turns
 ```

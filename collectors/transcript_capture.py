@@ -318,19 +318,32 @@ def transcribe_captured_audio(
         summary["skipped_reason"] = "no captured audio files"
         return summary
 
-    model = WhisperModel(
-        model_name or os.getenv("EMH_STT_MODEL", "base"),
-        compute_type="int8",
-    )
+    # Entries that already carry their whisper text (socket.io
+    # bot utterances are transcribed per-turn by the transport,
+    # collectors/socketio_capture) are reused verbatim -
+    # re-running whisper on the same files would silently add
+    # minutes to teardown for zero new information.
+    pending = [
+        entry for entry in usable
+        if not (entry.get("text") or "").strip()
+    ]
+    model = None
+    if pending:
+        model = WhisperModel(
+            model_name or os.getenv("EMH_STT_MODEL", "base"),
+            compute_type="int8",
+        )
 
     results = []
     for entry in usable:
-        segments, _info = model.transcribe(
-            entry["audio_path"], language="en"
-        )
-        text = " ".join(
-            segment.text.strip() for segment in segments
-        ).strip()
+        text = (entry.get("text") or "").strip()
+        if not text:
+            segments, _info = model.transcribe(
+                entry["audio_path"], language="en"
+            )
+            text = " ".join(
+                segment.text.strip() for segment in segments
+            ).strip()
         results.append(
             {
                 "turn": entry.get("turn"),
@@ -405,6 +418,9 @@ def clear_previous_capture_artifacts() -> list[str]:
     ]
     if AUDIO_DIR.exists():
         targets.extend(sorted(AUDIO_DIR.glob("*.webm")))
+        # Socket.io-transport bot utterances (reconstructed from
+        # bot-audio-chunk frames; see collectors/socketio_capture).
+        targets.extend(sorted(AUDIO_DIR.glob("bot_sio_*")))
 
     for path in targets:
         try:
@@ -423,6 +439,7 @@ def write_capture_evidence(
     socketio_frames: list[dict],
     audio_files: list[str],
     stt_summary: dict,
+    transport: str | None = None,
 ) -> dict:
     """
     Write artifacts/capture_evidence.json: one manifest per
@@ -487,6 +504,10 @@ def write_capture_evidence(
     ]
 
     evidence = {
+        # Which audio transport carried this interview:
+        # "livekit" (QA stack) or "socketio" (prod room-api
+        # stack, bot-audio-chunk frames). None = unknown/legacy.
+        "transport": transport,
         "sources": {
             "dom": {
                 "assistant_entries_with_text": len(dom_bot),
@@ -516,7 +537,12 @@ def write_capture_evidence(
                 "event_names": socketio_event_names,
                 "usable_bot_text": False,
                 "note": (
-                    "state events + candidate/job metadata "
+                    "audio transport on this stack: bot-audio-"
+                    "chunk / user-audio-chunk binary frames "
+                    "(reconstructed by collectors/"
+                    "socketio_capture); no text events"
+                    if transport == "socketio"
+                    else "state events + candidate/job metadata "
                     "only (audited 2026-08-14, docs/"
                     "bot_text_capture.md)"
                 ),

@@ -101,6 +101,12 @@ from pathlib import Path
 import pytest
 from playwright.async_api import async_playwright
 
+from collectors.socketio_capture import (
+    SOCKETIO_AUDIO_HOOK_JS,
+    SocketIOAnswerSource,
+    SocketIOBotWatcher,
+    SocketIOTransport,
+)
 from collectors.transcript_capture import (
     AUDIO_RECORD_JS,
     TRANSCRIPT_HOOK_JS,
@@ -1196,6 +1202,15 @@ _SOCKET_EXIT_MARKERS = (
     "INTERVIEW_COMPLETED",
     "INTERVIEW_ENDED",
     "INTERVIEW_END",
+    # Prod socket.io exit dialect observed 2026-09-02 (run
+    # 20260902_122950): the exit flag rides the final
+    # bot-audio-chunk as a positional arg (no "isExit":true
+    # string on the wire); the app then sends
+    # interview-state-change {"state":"EXITING"} and the server
+    # answers 42["status","REPORT_GENERATED"] before the socket
+    # is closed. Either frame is a definitive conclusion.
+    '"state":"EXITING"',
+    '"REPORT_GENERATED"',
 )
 
 
@@ -1808,6 +1823,7 @@ async def validate_greeting(
     watcher: BotAudioWatcher,
     collector: TranscriptCollector,
     deferred: list[dict] | None = None,
+    sio: SocketIOTransport | None = None,
 ) -> bool:
     """
     Verify Jamie's automatic greeting. Returns True if the
@@ -1859,7 +1875,23 @@ async def validate_greeting(
         if snapshot.get("remoteAudioTracks"):
             agent_joined = True
             break
+        # Socket.io audio transport (prod room-api stack): the
+        # agent never appears as a LiveKit participant - its
+        # audio arrives as bot-audio-chunk frames on the room
+        # socket. First transport to show evidence wins.
+        if sio is not None:
+            act = await sio.activity(page)
+            if act.get("botChunks"):
+                sio.active = True
+                agent_joined = True
+                break
         await asyncio.sleep(1.0)
+
+    if agent_joined and sio is not None and sio.active:
+        return await _validate_greeting_socketio(
+            page, context, recorder, stages, run_dir, sio,
+            pipe, deferred,
+        )
 
     if not agent_joined:
         livekit_alive = recorder.livekit_frame_count() > 0
@@ -1881,8 +1913,9 @@ async def validate_greeting(
                     "side is fine."
                     if livekit_alive else
                     "No LiveKit signalling frames were observed "
-                    "either - the room connection itself may have "
-                    "failed before the agent question even arises."
+                    "either, and no socket.io bot-audio-chunk "
+                    "frames arrived - the agent is silent on both "
+                    "known transports (LiveKit and socket.io)."
                 )
             ),
             likely_causes=[
@@ -2124,6 +2157,103 @@ async def validate_greeting(
     return False
 
 
+async def _validate_greeting_socketio(
+    page,
+    context,
+    recorder: PipelineRecorder,
+    stages: StageLog,
+    run_dir: Path,
+    sio: SocketIOTransport,
+    pipe: TurnPipeline,
+    deferred: list[dict],
+) -> bool:
+    """
+    Turn-0 greeting validation on the socket.io audio transport
+    (prod room-api stack): bot audio arrives as bot-audio-chunk
+    binary frames (utterance boundary = isLastChunk:true) and is
+    decoded/played by the app itself. LiveKit/RTC probes are
+    structurally empty here - their absence is expected, never
+    an error.
+    """
+
+    stages.stamp(
+        "[Turn 0] SOCKET.IO AUDIO TRANSPORT DETECTED: bot audio "
+        "arrives as socket.io bot-audio-chunk frames (no LiveKit "
+        "room on this stack). Missing RTC/LiveKit data is "
+        "expected here and is not treated as an error."
+    )
+
+    deadline = time.monotonic() + GREETING_TIMEOUT_S
+    act: dict = {}
+    while time.monotonic() < deadline:
+        act = await sio.activity(page)
+        if act.get("utterancesCompleted"):
+            break
+        await asyncio.sleep(1.0)
+
+    chunks = act.get("botChunks") or 0
+    total_bytes = act.get("botBytes") or 0
+    completed = act.get("utterancesCompleted") or 0
+    playback_ms = act.get("playbackMsTotal") or 0
+    playing = bool(act.get("botSpeaking"))
+
+    pipe.verdict(
+        "agent_publish", chunks > 0,
+        f"socket.io bot-audio-chunk frames: {chunks} "
+        f"({total_bytes} bytes), {completed} completed "
+        "utterance(s) [transport=socketio]",
+    )
+    pipe.verdict(
+        "inbound_rtp", total_bytes >= STATS_MIN_BYTES,
+        "bot audio bytes received on the room websocket: "
+        f"+{total_bytes} [transport=socketio - no RTP exists]",
+    )
+    pipe.verdict(
+        "audio_element", playback_ms > 0 or playing,
+        "app decoded and played the chunks (BOT_SPEAKING -> "
+        f"USER_WAITING cycle, playback {playback_ms:.0f} ms"
+        + (", still playing" if playing else "")
+        + ") [transport=socketio]",
+    )
+
+    if completed:
+        pipe.finalize()
+        stages.stamp(
+            "[Turn 0] PASSED - bot spoke first over socket.io "
+            f"({chunks} audio chunk(s), {total_bytes} bytes, "
+            f"playback {playback_ms:.0f} ms)."
+        )
+        for line in pipe.lines():
+            print(f"  {line}")
+        return True
+
+    message = await capture_failure(
+        page, context, recorder, stages, run_dir,
+        label=AGENT_JOINED_BUT_NO_AUDIO,
+        reason=(
+            "socket.io bot-audio-chunk traffic started "
+            f"({chunks} chunk(s), {total_bytes} bytes) but no "
+            "utterance completed (no isLastChunk:true frame) "
+            f"within {GREETING_TIMEOUT_S}s - the greeting never "
+            "finished arriving. [transport=socketio]"
+        ),
+        likely_causes=[
+            "The interview server's TTS stream stalled mid-"
+            "utterance (check room-api / agent worker logs).",
+            "The socket dropped mid-utterance (see the websocket "
+            "frames in the artifacts).",
+        ],
+        pipeline=pipe,
+        keep_trace=True,
+        screenshot_name="bot_responsiveness_turn00_stall.png",
+    )
+    defer_failure(
+        deferred, stages, turn=0, label=AGENT_JOINED_BUT_NO_AUDIO,
+        message=message,
+    )
+    return False
+
+
 # ============================================================
 # Phase 2: multi-turn responsiveness (after the greeting)
 # ============================================================
@@ -2275,6 +2405,76 @@ async def post_exit_grace(
     return summary
 
 
+def _livekit_response_verdicts(
+    pipe: TurnPipeline, result: dict | None, final_snapshot: dict
+) -> None:
+    """
+    LiveKit-transport per-turn verdicts for the response window
+    (agent_publish / inbound_rtp / audio_element) - unchanged
+    logic, factored out so the socket.io transport can supply
+    its own evidence instead.
+    """
+
+    live_tracks = [
+        track for track in
+        final_snapshot.get("remoteAudioTracks", [])
+        if track["readyState"] == "live"
+    ]
+    publishing = [
+        track for track in live_tracks if track["everUnmuted"]
+    ]
+    pipe.verdict(
+        "agent_publish", len(publishing) > 0,
+        f"{len(live_tracks)} live remote audio track(s), "
+        f"{len(publishing)} ever unmuted; mute states: "
+        + str([
+            (track["id"][:8], track["muted"])
+            for track in final_snapshot.get(
+                "remoteAudioTracks", []
+            )
+        ]),
+    )
+
+    # Browser inbound RTP: packets AND non-silent content.
+    if result:
+        packets_ok = (
+            result["bytes_delta"] >= STATS_MIN_BYTES
+            and result["packets_delta"] >= STATS_MIN_PACKETS
+        )
+        non_silent = result["max_level"] >= STATS_AUDIO_LEVEL
+        pipe.verdict(
+            "inbound_rtp", packets_ok and non_silent,
+            f"bytesReceived +{result['bytes_delta']}, "
+            f"packetsReceived +{result['packets_delta']}, "
+            f"max audioLevel {result['max_level']}"
+            + (
+                " (packets flowed but content is SILENCE)"
+                if packets_ok and not non_silent else ""
+            ),
+        )
+    else:
+        pipe.verdict("inbound_rtp", False, "no stats polled")
+
+    # Browser playback: decoded agent audio reaching WebAudio.
+    # The app attaches no dedicated <audio> element (its only
+    # media element is a muted <video> with no tracks), so
+    # element-level capture is NOT authoritative here -
+    # decoded remote-track energy is the playback signal, and
+    # element energy is recorded as extra detail only.
+    if result and (result["track_heard"] or result["element_heard"]):
+        pipe.verdict(
+            "audio_element", True,
+            f"decoded-track energy {result['track_ms']} ms, "
+            f"element energy {result['element_ms']} ms",
+        )
+    else:
+        pipe.verdict(
+            "audio_element", False,
+            "no decoded agent audio reached the browser's "
+            "WebAudio graph",
+        )
+
+
 async def run_multi_turn(
     page,
     context,
@@ -2290,6 +2490,7 @@ async def run_multi_turn(
     interview_status: dict | None = None,
     audio_manifest: list[dict] | None = None,
     deferred: list[dict] | None = None,
+    sio: SocketIOTransport | None = None,
 ) -> dict:
     """
     Drive the interview until the AI interviewer CONCLUDES it.
@@ -2375,22 +2576,44 @@ async def run_multi_turn(
         # The bot utterance that just ended is fully recorded -
         # persist it for the stt-local fallback (turn 1's
         # predecessor is the greeting).
-        clip_label = (
-            "bot_turn_00_greeting"
-            if turn == 1
-            else f"bot_turn_{turn - 1:02d}"
-        )
-        saved_clip = await stop_bot_audio_recording(
-            page, clip_label
-        )
-        if saved_clip:
-            audio_manifest.append(
-                {
-                    "role": "assistant",
-                    "turn": turn - 1,
-                    "audio_path": str(saved_clip),
-                }
+        if sio is not None and sio.active:
+            # Socket.io transport: the utterance(s) that just
+            # ended were reconstructed from bot-audio-chunk
+            # frames - persist them for the stt-local fallback.
+            try:
+                await sio.drain(page)
+            except Exception:
+                pass
+            for record in sio.take_unmanifested():
+                audio_manifest.append(
+                    {
+                        "role": "assistant",
+                        "turn": turn - 1,
+                        "audio_path": record["path"],
+                        # Whisper text the transport already
+                        # produced for this exact file - the
+                        # stt-local pass reuses it instead of
+                        # re-transcribing in teardown.
+                        "text": record.get("text"),
+                    }
+                )
+        else:
+            clip_label = (
+                "bot_turn_00_greeting"
+                if turn == 1
+                else f"bot_turn_{turn - 1:02d}"
             )
+            saved_clip = await stop_bot_audio_recording(
+                page, clip_label
+            )
+            if saved_clip:
+                audio_manifest.append(
+                    {
+                        "role": "assistant",
+                        "turn": turn - 1,
+                        "audio_path": str(saved_clip),
+                    }
+                )
 
         # Drive to REAL completion: stop once the interviewer
         # has signalled the interview is over (unless a fixed
@@ -2467,6 +2690,10 @@ async def run_multi_turn(
             mic_before = await mic_state(page)
             snapshot_before = await rtc_snapshot(page)
             out_before = outbound_totals(snapshot_before)
+            sio_before = (
+                await sio.activity(page)
+                if sio is not None and sio.active else {}
+            )
             body_before = await body_text_lines(page)
             await watcher.rebase()
             answer_start_wall = time.time() * 1000
@@ -2496,44 +2723,94 @@ async def run_multi_turn(
                 "harness is broken, this is NOT a bot failure."
             )
 
-            # Stage 2: outbound RTP - the answer must actually LEAVE
-            # the browser with real (non-silent) source audio.
+            # Stage 2: outbound - the answer must actually LEAVE
+            # the browser (RTP bytes on LiveKit; user-audio-chunk
+            # frames on the socket.io transport).
             snapshot_after_clip = await rtc_snapshot(page)
-            out_after = outbound_totals(snapshot_after_clip)
-            sent_delta = out_after["bytesSent"] - out_before["bytesSent"]
-            packets_sent_delta = (
-                out_after["packetsSent"] - out_before["packetsSent"]
-            )
-            pipe.verdict(
-                "outbound_rtp", sent_delta > 0,
-                f"bytesSent +{sent_delta}, packetsSent "
-                f"+{packets_sent_delta}, sourceAudioLevel "
-                f"{out_after['sourceAudioLevel']}",
-            )
-
-            # Stage 3: LiveKit received it - the SFU's RTCP receiver
-            # reports for our outbound stream are the only browser-
-            # observable proof of server-side receipt.
-            remote_reports = snapshot_after_clip.get(
-                "remoteInboundAudio", []
-            )
-            if remote_reports:
+            if sio is not None and sio.active:
+                sio_after = await sio.activity(page)
+                sent_delta = (
+                    (sio_after.get("userBytes") or 0)
+                    - (sio_before.get("userBytes") or 0)
+                )
+                chunks_sent_delta = (
+                    (sio_after.get("userChunks") or 0)
+                    - (sio_before.get("userChunks") or 0)
+                )
                 pipe.verdict(
-                    "livekit_receive", sent_delta > 0,
-                    f"RTCP receiver reports: {remote_reports}",
+                    "outbound_rtp", sent_delta > 0,
+                    "socket.io user-audio-chunk frames "
+                    f"+{chunks_sent_delta} (+{sent_delta} bytes) "
+                    "[transport=socketio - no RTP exists]",
+                )
+                # Server-side receipt: the room server broadcasts
+                # interview-state-change USER_SPEAKING once it
+                # hears the candidate stream.
+                server_ack = any(
+                    frame.get("direction") == "received"
+                    and frame.get("ts", 0) >= answer_start_wall
+                    and "USER_SPEAKING" in (frame.get("payload") or "")
+                    for frame in recorder.websocket_frames
+                )
+                if server_ack:
+                    pipe.verdict(
+                        "livekit_receive", True,
+                        "server acknowledged candidate audio "
+                        "(interview-state-change USER_SPEAKING) "
+                        "[transport=socketio]",
+                    )
+                else:
+                    pipe.record(
+                        "livekit_receive", "UNKNOWN",
+                        "no USER_SPEAKING server ack observed yet "
+                        "[transport=socketio - no RTCP exists]",
+                    )
+                stages.stamp(
+                    f"[Turn {turn}] Candidate audio delivered "
+                    f"({clip_ms} ms, mic energy {mic_energy} ms, "
+                    "socket.io user-audio-chunk "
+                    f"+{chunks_sent_delta} frames / "
+                    f"+{sent_delta} bytes)."
                 )
             else:
-                pipe.record(
-                    "livekit_receive", "UNKNOWN",
-                    "no remote-inbound-rtp reports exposed yet",
+                out_after = outbound_totals(snapshot_after_clip)
+                sent_delta = (
+                    out_after["bytesSent"] - out_before["bytesSent"]
+                )
+                packets_sent_delta = (
+                    out_after["packetsSent"] - out_before["packetsSent"]
+                )
+                pipe.verdict(
+                    "outbound_rtp", sent_delta > 0,
+                    f"bytesSent +{sent_delta}, packetsSent "
+                    f"+{packets_sent_delta}, sourceAudioLevel "
+                    f"{out_after['sourceAudioLevel']}",
                 )
 
-            stages.stamp(
-                f"[Turn {turn}] Candidate audio delivered ({clip_ms} ms, "
-                f"mic energy {mic_energy} ms, "
-                f"outbound bytesSent +{sent_delta}, published "
-                f"sourceAudioLevel {out_after['sourceAudioLevel']})."
-            )
+                # Stage 3: LiveKit received it - the SFU's RTCP
+                # receiver reports for our outbound stream are the
+                # only browser-observable proof of server-side
+                # receipt.
+                remote_reports = snapshot_after_clip.get(
+                    "remoteInboundAudio", []
+                )
+                if remote_reports:
+                    pipe.verdict(
+                        "livekit_receive", sent_delta > 0,
+                        f"RTCP receiver reports: {remote_reports}",
+                    )
+                else:
+                    pipe.record(
+                        "livekit_receive", "UNKNOWN",
+                        "no remote-inbound-rtp reports exposed yet",
+                    )
+
+                stages.stamp(
+                    f"[Turn {turn}] Candidate audio delivered ({clip_ms} ms, "
+                    f"mic energy {mic_energy} ms, "
+                    f"outbound bytesSent +{sent_delta}, published "
+                    f"sourceAudioLevel {out_after['sourceAudioLevel']})."
+                )
             if sent_delta <= 0:
                 # If the interview concluded while (or just before)
                 # this answer played, the app legitimately tears
@@ -2558,8 +2835,14 @@ async def run_multi_turn(
                     label=f"CANDIDATE AUDIO NOT PUBLISHED AT TURN {turn}",
                     reason=(
                         "The fake microphone carried energy locally but "
-                        "no outbound audio bytes were sent to LiveKit "
-                        f"during the {clip_ms} ms answer - the bot never "
+                        "no outbound audio "
+                        + (
+                            "was streamed over socket.io "
+                            "(user-audio-chunk frames)"
+                            if sio is not None and sio.active
+                            else "bytes were sent to LiveKit"
+                        )
+                        + f" during the {clip_ms} ms answer - the bot never "
                         "had a chance to hear it. This is a publish "
                         "problem (app or harness), NOT a bot-response "
                         "failure."
@@ -2718,64 +3001,40 @@ async def run_multi_turn(
 
             # Agent publish state during the response window.
             final_snapshot = result["snapshot"] if result else {}
-            live_tracks = [
-                track for track in
-                final_snapshot.get("remoteAudioTracks", [])
-                if track["readyState"] == "live"
-            ]
-            publishing = [
-                track for track in live_tracks if track["everUnmuted"]
-            ]
-            pipe.verdict(
-                "agent_publish", len(publishing) > 0,
-                f"{len(live_tracks)} live remote audio track(s), "
-                f"{len(publishing)} ever unmuted; mute states: "
-                + str([
-                    (track["id"][:8], track["muted"])
-                    for track in final_snapshot.get(
-                        "remoteAudioTracks", []
-                    )
-                ]),
-            )
-
-            # Browser inbound RTP: packets AND non-silent content.
-            if result:
-                packets_ok = (
-                    result["bytes_delta"] >= STATS_MIN_BYTES
-                    and result["packets_delta"] >= STATS_MIN_PACKETS
-                )
-                non_silent = result["max_level"] >= STATS_AUDIO_LEVEL
+            if sio is not None and sio.active:
+                # Socket.io transport verdicts: chunk frames are
+                # the publish/receive evidence and the app's own
+                # BOT_SPEAKING -> USER_WAITING playback window is
+                # the playback evidence. The RTC probes are empty
+                # BY DESIGN here - never judged.
                 pipe.verdict(
-                    "inbound_rtp", packets_ok and non_silent,
-                    f"bytesReceived +{result['bytes_delta']}, "
-                    f"packetsReceived +{result['packets_delta']}, "
-                    f"max audioLevel {result['max_level']}"
-                    + (
-                        " (packets flowed but content is SILENCE)"
-                        if packets_ok and not non_silent else ""
+                    "agent_publish",
+                    bool(result and result["packets_delta"] > 0),
+                    "socket.io bot-audio-chunk frames "
+                    f"+{result['packets_delta'] if result else 0} "
+                    f"({result.get('utterance_delta', 0) if result else 0}"
+                    " completed utterance(s)) [transport=socketio]",
+                )
+                pipe.verdict(
+                    "inbound_rtp",
+                    bool(
+                        result
+                        and result["bytes_delta"] >= STATS_MIN_BYTES
                     ),
+                    "bot audio bytes on the room websocket "
+                    f"+{result['bytes_delta'] if result else 0} "
+                    "[transport=socketio - no RTP exists]",
+                )
+                pipe.verdict(
+                    "audio_element",
+                    bool(result and result["speech_ms"] > 0),
+                    "app playback window "
+                    f"{result['speech_ms'] if result else 0} ms "
+                    "(BOT_SPEAKING -> USER_WAITING) "
+                    "[transport=socketio]",
                 )
             else:
-                pipe.verdict("inbound_rtp", False, "no stats polled")
-
-            # Browser playback: decoded agent audio reaching WebAudio.
-            # The app attaches no dedicated <audio> element (its only
-            # media element is a muted <video> with no tracks), so
-            # element-level capture is NOT authoritative here -
-            # decoded remote-track energy is the playback signal, and
-            # element energy is recorded as extra detail only.
-            if result and (result["track_heard"] or result["element_heard"]):
-                pipe.verdict(
-                    "audio_element", True,
-                    f"decoded-track energy {result['track_ms']} ms, "
-                    f"element energy {result['element_ms']} ms",
-                )
-            else:
-                pipe.verdict(
-                    "audio_element", False,
-                    "no decoded agent audio reached the browser's "
-                    "WebAudio graph",
-                )
+                _livekit_response_verdicts(pipe, result, final_snapshot)
 
             turn_reports.append(
                 {
@@ -3148,6 +3407,10 @@ async def test_bot_greets_first_then_stays_responsive():
     # / per-turn stalls). They never end the interview; they are
     # reported after the AI interviewer concludes it.
     deferred: list[dict] = []
+    # Socket.io audio transport adapter. Stays inactive on the
+    # LiveKit (QA) stack; flips active the moment bot-audio-chunk
+    # traffic is observed (prod room-api stack).
+    sio = SocketIOTransport(log=stages.stamp)
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -3170,6 +3433,11 @@ async def test_bot_greets_first_then_stays_responsive():
         # see collectors/transcript_capture.py.
         await context.add_init_script(TRANSCRIPT_HOOK_JS)
         await context.add_init_script(AUDIO_RECORD_JS)
+        # Socket.io audio transport observer (prod room-api
+        # stack: bot-audio-chunk / user-audio-chunk binary
+        # frames instead of LiveKit) - see
+        # collectors/socketio_capture.py.
+        await context.add_init_script(SOCKETIO_AUDIO_HOOK_JS)
         await context.tracing.start(screenshots=True, snapshots=True)
 
         page = await context.new_page()
@@ -3230,8 +3498,25 @@ async def test_bot_greets_first_then_stays_responsive():
             # the interview loop prompt the bot.
             detector_ok = await validate_greeting(
                 page, context, recorder, stages, run_dir, watcher,
-                collector, deferred=deferred,
+                collector, deferred=deferred, sio=sio,
             )
+
+            # Transport adapters for the drive loop. The LiveKit
+            # (QA) path keeps the existing watcher and caption-
+            # stream answer source untouched.
+            if sio.active:
+                stages.stamp(
+                    "Transport=socketio: switching to the "
+                    "socket.io bot watcher and the whisper-STT "
+                    "live-question source (this stack publishes "
+                    "no caption/data channel)."
+                )
+                watcher = SocketIOBotWatcher(page)
+                answers = SocketIOAnswerSource(
+                    simulator, sio,
+                    save_path=SIMULATOR_TURNS_PATH,
+                    log=stages.stamp,
+                )
 
             # Phase 2: drive the FULL interview until the AI
             # interviewer concludes it. Stalls are recorded as
@@ -3245,6 +3530,7 @@ async def test_bot_greets_first_then_stays_responsive():
                 interview_status=interview_status,
                 audio_manifest=audio_manifest,
                 deferred=deferred,
+                sio=sio,
             )
 
             # A whole interview that never reached the bot's
@@ -3315,6 +3601,9 @@ async def test_bot_greets_first_then_stays_responsive():
                 json.dumps(
                     {
                         "room": recorder.room_name,
+                        "transport": (
+                            "socketio" if sio.active else "livekit"
+                        ),
                         "greeting_detector_ok": detector_ok,
                         "interview_complete": interview_status["complete"],
                         "conclusion_reason": (
@@ -3435,6 +3724,26 @@ async def test_bot_greets_first_then_stays_responsive():
                     f"(harness issue, not a bot failure): {error}"
                 )
 
+            # Socket.io transport: flush any bot utterances not
+            # yet drained (closing statement / last reply).
+            if sio.active:
+                try:
+                    await sio.drain(page)
+                except Exception as error:
+                    print(
+                        "[socketio] final utterance drain failed "
+                        f"(harness issue, not a bot failure): {error}"
+                    )
+                for record in sio.take_unmanifested():
+                    audio_manifest.append(
+                        {
+                            "role": "assistant",
+                            "turn": interview_status["turns_completed"],
+                            "audio_path": record["path"],
+                            "text": record.get("text"),
+                        }
+                    )
+
             # Persist the final bot utterance still being
             # recorded (closing statement / last reply).
             final_clip = await stop_bot_audio_recording(
@@ -3502,6 +3811,9 @@ async def test_bot_greets_first_then_stays_responsive():
                         if entry["role"] == "assistant"
                     ],
                     stt_summary=stt_summary,
+                    transport=(
+                        "socketio" if sio.active else "livekit"
+                    ),
                 )
                 usable = [
                     name

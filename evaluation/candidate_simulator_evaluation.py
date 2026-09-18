@@ -299,7 +299,9 @@ def validate_simulator_result(
 # Judge + per-run summary
 # ============================================================
 
-def nemotron_judge(prompt: str, response_format: dict[str, Any]) -> str:
+def default_judge(prompt: str, response_format: dict[str, Any]) -> str:
+    """Default judge: GPT-OSS (MODEL_NAME) via evaluation.models."""
+
     from evaluation.models import evaluate_with_nvidia
 
     return evaluate_with_nvidia(prompt, response_format=response_format)
@@ -330,7 +332,7 @@ def evaluate_simulator_run(
 
     prompt = build_simulator_judge_prompt(turns, role, mode)
     assert_prompt_is_candidate_only(prompt)
-    raw = (judge or nemotron_judge)(prompt, build_simulator_response_schema(len(turns), mode))
+    raw = (judge or default_judge)(prompt, build_simulator_response_schema(len(turns), mode))
     results = validate_simulator_result(_parse_json(raw), turns, mode, persona)
 
     summary: dict[str, Any] = {

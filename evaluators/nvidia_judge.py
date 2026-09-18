@@ -1,15 +1,18 @@
 """
-Shared DeepEval judge backed by NVIDIA Nemotron via the
+Shared DeepEval judge backed by GPT-OSS via the NVIDIA NIM
 OpenAI-compatible API (https://integrate.api.nvidia.com/v1).
 
 All AI quality tests use this judge so the evaluation model
-is configured in exactly one place (.env).
+is configured in exactly one place (.env: API_KEY, BASE_URL,
+MODEL_NAME, read by config.settings as JUDGE_*).
 
 The judge subclasses DeepEval's LocalModel to enforce NVIDIA
 structured output on every call: when DeepEval requests a
 pydantic schema, the exact JSON schema is sent as
 response_format, so the model cannot return malformed keys
-(e.g. ".score") or prose around the JSON.
+(e.g. ".score") or prose around the JSON. GPT-OSS honours
+json_schema on this endpoint and keeps its reasoning out of
+message.content (verified 2026-09-08).
 """
 
 from typing import Optional, Tuple, Union
@@ -22,16 +25,16 @@ from deepeval.models.llms.utils import trim_and_load_json
 from deepeval.models.retry_policy import create_retry_decorator
 
 from config.settings import (
-    NVIDIA_API_KEY,
-    NVIDIA_BASE_URL,
-    NVIDIA_MODEL,
+    JUDGE_API_KEY,
+    JUDGE_BASE_URL,
+    JUDGE_MODEL,
 )
 
 
 retry_nvidia = create_retry_decorator(PS.LOCAL)
 
 
-class NemotronJudge(LocalModel):
+class NvidiaStructuredJudge(LocalModel):
     """
     LocalModel with per-call structured output enforcement.
 
@@ -114,20 +117,21 @@ class NemotronJudge(LocalModel):
         return content, 0.0
 
 
-def get_nvidia_judge() -> NemotronJudge:
+def get_nvidia_judge() -> NvidiaStructuredJudge:
     """
-    Return the NVIDIA Nemotron judge for DeepEval metrics.
+    Return the shared judge (GPT-OSS on the NVIDIA endpoint)
+    for DeepEval metrics.
     """
 
-    if not NVIDIA_API_KEY:
+    if not JUDGE_API_KEY:
         raise RuntimeError(
-            "NVIDIA_API_KEY is not configured. "
-            "Add NVIDIA_API_KEY to the .env file."
+            "API_KEY (judge model key) is not configured. "
+            "Add API_KEY, BASE_URL and MODEL_NAME to the .env file."
         )
 
-    return NemotronJudge(
-        model=NVIDIA_MODEL,
-        base_url=NVIDIA_BASE_URL,
-        api_key=NVIDIA_API_KEY,
+    return NvidiaStructuredJudge(
+        model=JUDGE_MODEL,
+        base_url=JUDGE_BASE_URL,
+        api_key=JUDGE_API_KEY,
         temperature=0,
     )

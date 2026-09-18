@@ -27,15 +27,75 @@ from tests.e2e import shared_room as sr
 # Fakes
 # ------------------------------------------------------------
 
+class FakeLocator:
+    """Minimal role-locator fake: one End Interview button."""
+
+    def __init__(self, page, present):
+        self._page = page
+        self._present = present
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return 1 if self._present else 0
+
+    async def click(self, timeout=None):
+        self._page.recorder.events.append("click_end")
+        self._page.app_left = True
+
+    async def wait_for(self, state=None, timeout=None):
+        raise TimeoutError("no confirm dialog")
+
+
 class FakePage:
-    def __init__(self):
+    """
+    Simulates the in-page room-exit hooks: the app's End button
+    closes everything by itself only when `app_leave_works`;
+    otherwise the explicit __emhRoomExit.leave() must do it.
+    """
+
+    def __init__(self, recorder=None, has_end_button=True,
+                 app_leave_works=True):
         self._closed = False
+        self.recorder = recorder or Recorder()
+        self.has_end_button = has_end_button
+        self.app_leave_works = app_leave_works
+        self.app_left = False
+        self.open = {"sockets": 2, "pcs": 1, "tracks": 1}
 
     def is_closed(self):
         return self._closed
 
     def on(self, *_args, **_kwargs):
         pass
+
+    def once(self, *_args, **_kwargs):
+        pass
+
+    def get_by_role(self, role, name=None):
+        return FakeLocator(self, self.has_end_button)
+
+    def _state(self):
+        if self.app_left and self.app_leave_works:
+            self.open = {"sockets": 0, "pcs": 0, "tracks": 0}
+        return {
+            "openSockets": self.open["sockets"],
+            "openLiveKitSockets": self.open["sockets"],
+            "openPeerConnections": self.open["pcs"],
+            "liveLocalTracks": self.open["tracks"],
+        }
+
+    async def evaluate(self, expression):
+        if "state()" in expression:
+            return self._state()
+        if "leave()" in expression:
+            before = self._state()
+            self.recorder.events.append("explicit_leave")
+            self.open = {"sockets": 0, "pcs": 0, "tracks": 0}
+            return {"before": before, "after": self._state()}
+        raise AssertionError(f"unexpected evaluate: {expression}")
 
 
 class Recorder:
@@ -44,6 +104,7 @@ class Recorder:
         self.launches = []
         self.marks = []
         self.leaves = []
+        self.events = []
 
 
 @pytest.fixture
@@ -55,7 +116,7 @@ def rig(monkeypatch):
 
     manager = sr.SharedRoomJoin()
     recorder = Recorder()
-    fake_page = FakePage()
+    fake_page = FakePage(recorder)
     fake_claims = object()
 
     async def fake_start_page():
@@ -74,6 +135,7 @@ def rig(monkeypatch):
 
     async def fake_leave(page, log=None):
         recorder.leaves.append(page)
+        recorder.events.append("navigate_away")
 
     monkeypatch.setattr(manager, "_start_page", fake_start_page)
 
@@ -126,6 +188,91 @@ async def test_close_runs_exactly_once(rig):
 
     assert recorder.leaves == [fake_page]
     assert manager.closed
+
+
+# ------------------------------------------------------------
+# Explicit room exit before the browser goes away
+# ------------------------------------------------------------
+
+async def test_close_exits_room_explicitly_before_navigating_away(rig):
+    manager, recorder, fake_page = rig
+
+    await manager.ensure_joined("test_continue_to_interview")
+    await manager.close()
+
+    # Order: app End button -> explicit socket/PC/track close ->
+    # navigate away (unload flush) -> browser teardown.
+    assert recorder.events == ["click_end", "explicit_leave", "navigate_away"]
+    assert manager.left_room is True
+    assert manager.exit_report["clicked_end"] is True
+    assert manager.exit_report["verified"] is True
+    assert manager.exit_report["final"]["openSockets"] == 0
+    assert manager.exit_report["final"]["openPeerConnections"] == 0
+    assert manager.exit_report["final"]["liveLocalTracks"] == 0
+
+
+async def test_explicit_disconnect_covers_app_leave_that_does_nothing(
+    rig, monkeypatch
+):
+    manager, recorder, fake_page = rig
+    fake_page.app_leave_works = False
+    monkeypatch.setattr(sr, "APP_LEAVE_SETTLE_S", 0.3)
+
+    await manager.ensure_joined("test_continue_to_interview")
+    await manager.close()
+
+    # The app's End button left everything open; the explicit
+    # in-page disconnect still closed it all and was verified.
+    assert recorder.events == ["click_end", "explicit_leave", "navigate_away"]
+    assert manager.exit_report["forced"]["before"]["openSockets"] == 2
+    assert manager.exit_report["forced"]["after"]["openSockets"] == 0
+    assert manager.left_room is True
+
+
+async def test_exit_without_end_button_still_disconnects(rig):
+    manager, recorder, fake_page = rig
+    fake_page.has_end_button = False
+
+    await manager.ensure_joined("test_continue_to_interview")
+    await manager.close()
+
+    assert recorder.events == ["explicit_leave", "navigate_away"]
+    assert manager.exit_report["clicked_end"] is False
+    assert manager.left_room is True
+
+
+async def test_exit_runs_even_after_a_consumer_failed(rig):
+    """
+    The shared_room fixture tears down after the last consumer
+    whatever its outcome; the manager must exit the room then
+    regardless of how the tests went.
+    """
+
+    manager, recorder, fake_page = rig
+
+    await manager.ensure_joined("test_continue_to_interview")
+    with pytest.raises(AssertionError):
+        assert False, "simulated consumer failure"
+    await manager.close()
+
+    assert recorder.events == ["click_end", "explicit_leave", "navigate_away"]
+    assert manager.closed and manager.left_room
+
+
+async def test_exit_is_exception_safe_when_page_hooks_break(rig, monkeypatch):
+    manager, recorder, fake_page = rig
+
+    async def broken_evaluate(expression):
+        raise RuntimeError("page gone")
+
+    await manager.ensure_joined("test_continue_to_interview")
+    monkeypatch.setattr(fake_page, "evaluate", broken_evaluate)
+    await manager.close()  # must not raise
+
+    assert manager.closed
+    assert manager.left_room is False
+    # Navigate-away + browser teardown still ran.
+    assert recorder.leaves == [fake_page]
 
 
 # ------------------------------------------------------------

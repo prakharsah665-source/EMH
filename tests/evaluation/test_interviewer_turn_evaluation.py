@@ -55,7 +55,7 @@ CAPTURED = [
 
 
 def stub_judge_factory(score_for_turn, issues_for_turn=None):
-    """A deterministic stand-in for Nemotron that records the prompt."""
+    """A deterministic stand-in for the judge that records the prompt."""
 
     seen = {}
 

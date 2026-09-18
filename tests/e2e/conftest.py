@@ -16,6 +16,8 @@ first). Tests that cannot get a URL still fail/skip through their
 own session-layer messages - the fixture only enforces the lock.
 """
 
+import asyncio
+
 import pytest
 import pytest_asyncio
 
@@ -116,7 +118,36 @@ def _shared_room_state(request):
         for item in request.session.items
         if is_room_join_nodeid(item.nodeid)
     }
-    return SharedRoomJoin(), pending
+    manager = SharedRoomJoin()
+
+    def _safety_net():
+        # Normally the shared_room fixture below has already
+        # exited the room after the last consumer. This runs at
+        # session end as a last line of defence (e.g. a consumer
+        # errored before its fixture teardown, or the run was
+        # interrupted) so the EMH_TESTS_URL room is never left
+        # joined behind a closed harness.
+        if manager.closed:
+            return
+        print(
+            "[shared_room] safety net: room still open at session "
+            "end - exiting/disconnecting now."
+        )
+        loop = manager.loop
+        try:
+            if loop is None or loop.is_closed():
+                asyncio.run(manager.close())
+            elif loop.is_running():
+                # Cannot block a running loop from its own thread;
+                # schedule and let the loop drain it.
+                loop.create_task(manager.close())
+            else:
+                loop.run_until_complete(manager.close())
+        except Exception as error:
+            print(f"[WARNING] shared_room safety-net teardown: {error}")
+
+    request.addfinalizer(_safety_net)
+    return manager, pending
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -129,7 +160,13 @@ async def shared_room(request, _shared_room_state):
     """
 
     manager, pending = _shared_room_state
-    yield manager
-    pending.discard(request.node.nodeid)
-    if not pending:
-        await manager.close()
+    try:
+        yield manager
+    finally:
+        # Runs whether the consumer passed, failed or skipped.
+        pending.discard(request.node.nodeid)
+        if not pending:
+            # Explicit room exit (End Interview + LiveKit/socket
+            # disconnect, verified) -> navigate away -> browser
+            # close. Exception-safe inside close().
+            await manager.close()

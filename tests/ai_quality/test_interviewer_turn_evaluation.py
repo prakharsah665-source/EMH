@@ -2,7 +2,7 @@
 Per-turn judgment of the REAL AI interviewer.
 
 For every interviewer turn captured from the live interview the
-judge (NVIDIA Nemotron, temperature 0) reads the preceding
+judge (GPT-OSS via NVIDIA NIM, temperature 0) reads the preceding
 conversation, decides independently whether this was the right
 question/response at this point, scores relevance, clarity,
 question quality, context awareness / logical follow-up,

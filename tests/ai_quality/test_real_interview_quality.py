@@ -9,7 +9,7 @@ run. A missing capture fails loudly - there is no synthetic
 fallback.
 
 Each dimension keeps the package's existing 0.70 threshold and
-the existing Nemotron judge, and is scored with a 3-run median
+the shared GPT-OSS judge, and is scored with a 3-run median
 plus run-disagreement reporting (evaluators/consistent_geval).
 """
 

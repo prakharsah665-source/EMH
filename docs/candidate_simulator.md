@@ -12,7 +12,7 @@ simulator + blind judge). Report section: "Candidate Simulator
 |---|---|---|
 | personas (opaque ids, non-overlapping bands) | `simulator/personas.py` | weak [0,.4) · average [.4,.7) · strong [.7,1]; adversarial specs for robustness |
 | role / seniority context | `simulator/role_context.py` | parsed from the socket.io `job-candidate-details` frame the E2E drive records (role, skills, JD experience, candidate years) |
-| simulator | `simulator/candidate_simulator.py` | model family must differ from interviewer (GPT) and judge (Nemotron) — enforced by `assert_model_family_allowed`; default `google/diffusiongemma-26b-a4b-it` via the NVIDIA endpoint, override `EMH_SIMULATOR_MODEL`; records `intended_text` per turn |
+| simulator | `simulator/candidate_simulator.py` | model must not be in the interviewer's family (GPT) and must not equal the judge model (GPT-OSS, `MODEL_NAME` in .env) — enforced by `assert_model_family_allowed`; model and key read from `.env` (`NEMOTRON_MODEL_NAME`, `NEMOTRON_API_KEY`; no hardcoded default) via the NVIDIA endpoint; records `intended_text` per turn |
 | judge (own call, blind) | `evaluation/candidate_simulator_evaluation.py` | prompt carries NO persona label/band; scores observed traits per turn; Python maps to the hidden band → adherence + drift; robustness: `spec_executed`, refusing = FAILURE |
 | gates | same | `check_monotonic_separation` (inversion / collapse / overlap → CI fail), `stimulus_validity` (gates interviewer-score validity; never aggregated) |
 

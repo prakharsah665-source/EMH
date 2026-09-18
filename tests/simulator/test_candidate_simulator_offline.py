@@ -68,9 +68,26 @@ def judge_factory(competence=None, executed=None, leak_turns=()):
 # ---------------- model family rule ----------------
 
 def test_simulator_model_family_must_differ_from_interviewer_and_judge():
-    for bad in ("gpt-4o", "openai/gpt-5.6-luna", "nvidia/nemotron-3-nano-30b-a3b"):
+    # Interviewer family always rejected; the judge rule is exact
+    # model inequality (relaxed from family-wide 2026-09-02 when
+    # the simulator moved to Nemotron after Gemma's retirement).
+    for bad in ("gpt-4o", "openai/gpt-5.6-luna"):
         with pytest.raises(SimulatorModelError):
             assert_model_family_allowed(bad)
+    with pytest.raises(SimulatorModelError):
+        assert_model_family_allowed(
+            "nvidia/nemotron-judge-x", judge_model="nvidia/nemotron-judge-x"
+        )
+    assert_model_family_allowed(
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        judge_model="nvidia/nemotron-3-nano-30b-a3b",
+    )
+    # Current judge (GPT-OSS on the NVIDIA endpoint): the
+    # Nemotron simulator is a different family, so allowed.
+    assert_model_family_allowed(
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        judge_model="openai/gpt-oss-20b",
+    )
     assert_model_family_allowed("meta/llama-3.3-70b-instruct")
     assert_model_family_allowed("google/diffusiongemma-26b-a4b-it")
     assert_model_family_allowed("mistralai/mistral-large")

@@ -62,7 +62,7 @@ SUITES = {
         "LLM-judged checks that the AI interviewer handles "
         "interview events (start, follow-ups, "
         "clarifications, off-topic answers, completion) "
-        "appropriately. Judge: NVIDIA Nemotron, "
+        "appropriately. Judge: GPT-OSS via NVIDIA NIM, "
         "temperature=0.",
     ),
     "tests.ai_quality": (
@@ -73,11 +73,11 @@ SUITES = {
         "retention, question repetition and more, plus a "
         "per-turn judgment of every interviewer utterance in "
         "context (docs/interviewer_turn_evaluation.md). "
-        "Judge: NVIDIA Nemotron, temperature=0.",
+        "Judge: GPT-OSS via NVIDIA NIM, temperature=0.",
     ),
     "tests.simulator": (
         "Candidate Simulator (stimulus validity)",
-        "Third scoring target, judged in its own Nemotron call "
+        "Third scoring target, judged in its own judge call "
         "with its own rubric and blind to the persona label: "
         "per-turn persona adherence / drift, meta-leakage, "
         "role + seniority fit, monotonic separation "
@@ -89,8 +89,8 @@ SUITES = {
     ),
     "tests.evaluation": (
         "Interview Quality Gate (CI)",
-        "Full-transcript rubric evaluation via NVIDIA "
-        "Nemotron with structured JSON output, discrete "
+        "Full-transcript rubric evaluation via GPT-OSS "
+        "(NVIDIA NIM) with structured JSON output, discrete "
         "scores (0, 0.25, 0.5, 0.75, 1.0), 3-run median "
         "scoring and per-criterion CI thresholds.",
     ),
@@ -114,6 +114,16 @@ SUITES = {
         "detectors, unit-tested offline and used to audit the "
         "real captured transcript. Plus an opt-in DeepTeam live "
         "red-team (py3.13 security venv).",
+    ),
+    "tests.app_e2e": (
+        "Application E2E - Dashboard Data Validation",
+        "Independent of the interview flow: logs in to the "
+        "dashboard web app with LOGIN_EMAIL/LOGIN_PASSWORD, reads "
+        "the dashboard-data API, validates its schema/types/values/"
+        "consistency and compares every rendered KPI, stage "
+        "breakdown, chart and credits row with the API "
+        "(docs/dashboard_validation.md). Its own PASS/FAIL report: "
+        "reports/dashboard_validation_report.html.",
     ),
 }
 
@@ -183,6 +193,9 @@ def ordered_test_paths() -> list[str]:
         ROOT / "tests/ai_quality",
         ROOT / "tests/api",
         ROOT / "tests/evaluation",
+        # Application E2E (dashboard) last: it has no dependency on
+        # the interview capture and must never delay it.
+        ROOT / "tests/app_e2e",
     ]
 
     return [str(path) for path in ordered if path.exists()]
@@ -699,7 +712,7 @@ Every test row can be expanded: "Captured output" holds the
 full per-test stdout (LLM judge scores and reasoning, page
 state dumps, connection logs); failed tests additionally
 show the assertion or traceback under "Failure detail".
-LLM-judged suites use NVIDIA Nemotron at temperature 0 with
+LLM-judged suites use GPT-OSS (NVIDIA NIM) at temperature 0 with
 structured JSON output; the CI quality gate scores the
 transcript three times and applies the median per criterion,
 so a single inconsistent judgment cannot fail the build.

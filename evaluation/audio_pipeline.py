@@ -4,7 +4,7 @@ Audio evaluation layer for the EMH interviewer.
 Connects the chain:
 
     audio (per-turn records)
-      -> diarization / STT metrics   (pyannote.metrics / jiwer)
+      -> diarization / STT    (pyannote. / jiwer)
       -> transcript                  (evaluation.transcript format)
       -> existing Nemotron/DeepEval  (evaluation.evaluator - only
                                       when explicitly requested)
@@ -16,7 +16,7 @@ background speech present/attributed to the candidate (DER +
 attribution), and does the combination make agent-side
 interference plausible for that turn.
 
-The jiwer / pyannote.metrics layer is fully local. The Nemotron
+The jiwer / pyannote. layer is fully local. The Nemotron
 judge is NEVER imported or called unless run_full_evaluation is
 invoked with run_nemotron=True, so importing this module and
 running its unit tests costs no API credits.
@@ -60,7 +60,7 @@ REAL_AUDIO_RECORDS_PATH = Path(
 # speaker segments, so pyannote diarization stays "unavailable"
 # on a normal run. When a real diarization pass (any tool) writes
 # this file, its segments are merged into the records by turn so
-# the pyannote metrics run against real data.
+# the pyannote  run against real data.
 #   {"turns": [{"turn": 1,
 #               "reference_segments": [{start,end,speaker}, ...],
 #               "detected_segments":  [{start,end,speaker}, ...]}]}
@@ -220,7 +220,7 @@ def merge_diarization_sidecar(
 
 def evaluate_audio_turn(record: AudioTurnRecord) -> AudioTurnEvaluation:
     """
-    Run the local audio metrics for one turn and decide whether
+    Run the local audio  for one turn and decide whether
     background interference plausibly degraded it.
     """
 
@@ -341,12 +341,13 @@ def run_full_evaluation(
     """
     The full audio evaluation layer.
 
-    Always runs the local jiwer/pyannote metrics. Only when
+    Always runs the local jiwer/pyannote . Only when
     run_nemotron=True does it import and call the existing
-    Nemotron rubric evaluator (evaluation.evaluator) on the
-    STT-derived transcript - the import happens lazily HERE so
-    that module import and unit tests never touch the NVIDIA
-    client or require credits.
+    LLM rubric evaluator (evaluation.evaluator, GPT-OSS on the
+    NVIDIA endpoint; the parameter and report key keep their
+    historical "nemotron" names) on the STT-derived transcript -
+    the import happens lazily HERE so that module import and
+    unit tests never touch the NVIDIA client or require quota.
     """
 
     evaluations = evaluate_audio_turns(records)

@@ -640,11 +640,12 @@ def validate_turn_result(
 # Judge + aggregation
 # ============================================================
 
-def nemotron_judge(prompt: str, response_format: dict[str, Any]) -> str:
-    """Default judge: NVIDIA Nemotron via evaluation.models."""
+def default_judge(prompt: str, response_format: dict[str, Any]) -> str:
+    """Default judge: GPT-OSS (MODEL_NAME) via evaluation.models."""
 
-    # Imported lazily: evaluation.models requires NVIDIA_API_KEY
-    # at import time and the offline tests inject a stub judge.
+    # Imported lazily: evaluation.models requires the judge
+    # API_KEY at import time and the offline tests inject a
+    # stub judge.
     from evaluation.models import evaluate_with_nvidia
 
     return evaluate_with_nvidia(prompt, response_format=response_format)
@@ -714,7 +715,7 @@ def evaluate_interviewer_turns(
 
     prompt = build_turn_prompt(units)
     schema = build_turn_response_schema(len(units))
-    raw = (judge or nemotron_judge)(prompt, schema)
+    raw = (judge or default_judge)(prompt, schema)
     parsed = _parse_json(raw)
     results = validate_turn_result(parsed, units)
 

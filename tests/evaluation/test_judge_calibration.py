@@ -1,5 +1,5 @@
 """
-Judge calibration: prove the Nemotron rubric judge can tell a
+Judge calibration: prove the GPT-OSS rubric judge can tell a
 good interview from a bad one BEFORE trusting it to gate CI.
 
 Golden set (data/calibration/):
@@ -16,7 +16,8 @@ this test exists to catch. Both cases use the same 3-run-median
 consistency path as the real gate, so run disagreement is
 reported here too.
 
-Requires NVIDIA credits (marked ai_evaluation, like the gate).
+Requires NVIDIA NIM quota for the judge key (marked
+ai_evaluation, like the gate).
 """
 
 from pathlib import Path
